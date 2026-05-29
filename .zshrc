@@ -98,7 +98,7 @@ dev() {
   else
     echo "Starting $session in $dir"
     tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
-    tmux send-keys -t "$session" "git stash; git fetch origin; git checkout dev/claude-1 2>/dev/null || git checkout -b dev/claude-1 && git pull origin dev/claude-1 && claude" Enter
+    tmux send-keys -t "$session" "git stash; git fetch origin; git checkout dev/claude-1 2>/dev/null || git checkout -b dev/claude-1; git pull origin dev/claude-1; claude" Enter
     tmux attach-session -t "$session"
   fi
 }
