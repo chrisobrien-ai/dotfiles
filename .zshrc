@@ -44,31 +44,31 @@ nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disables
 # dots — pull latest dotfiles and reload zsh
 dots() { cd ~/code/dotfiles && git pull && source ~/.zshrc && cd - > /dev/null; }
 
-# tgo [repo[slot]] — attach to an existing dev tmux session
+# tgo [repo] [slot] — attach to an existing dev tmux session
 # tgo        → list all dev sessions
 # tgo ff     → attach to first ff session
-# tgo ff3    → attach to dev-ff-3
+# tgo ff 3   → attach to dev-ff-3
 tgo() {
-  local arg="$1"
+  local repo="$1"
+  local slot="$2"
 
   # no args — list sessions
-  if [[ -z "$arg" ]]; then
+  if [[ -z "$repo" ]]; then
     tmux list-sessions -F '#S' 2>/dev/null | grep '^dev-' || echo "No dev sessions running."
     return
   fi
 
-  # parse repo + optional slot: ff, ff1, ff2, cfp, cfp2, cf, cf1 ...
-  local repo slot
-  if [[ "$arg" =~ ^(cfp)([0-9]+)?$ ]]; then
-    repo="cfp"; slot="${match[2]}"
-  elif [[ "$arg" =~ ^(ff|cf)([0-9]+)?$ ]]; then
-    repo="${match[1]}"; slot="${match[2]}"
-  else
-    echo "Unknown repo: $arg. Use ff, ff2, cfp, cfp2, cf, cf2 ..."
+  local -A repo_paths
+  repo_paths[ff]="$HOME/code/financial-forecast"
+  repo_paths[cfp]="$HOME/code/cashfwd-private"
+  repo_paths[cf]="$HOME/code/cashfwd"
+
+  if [[ -z "${repo_paths[$repo]}" ]]; then
+    echo "Unknown repo: $repo. Use ff, cfp, or cf."
     return 1
   fi
 
-  # default slot: find first existing session for this repo
+  # no slot — find first existing session for this repo
   if [[ -z "$slot" ]]; then
     local n=1
     while (( n <= 20 )); do
