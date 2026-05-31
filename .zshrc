@@ -153,13 +153,52 @@ dev() {
 
   local session="dev-${repo}-${slot}"
 
+  local logdir="$HOME/.tmux-logs"
+  local logfile="$logdir/${session}.log"
+  mkdir -p "$logdir"
+
   if tmux has-session -t "$session" 2>/dev/null; then
     echo "Reattaching $session"
+    # resume logging if it stopped (e.g. after server restart)
+    tmux pipe-pane -t "$session" -o "cat >> $logfile"
     tmux attach-session -t "$session"
   else
-    echo "Starting $session in $dir"
+    echo "Starting $session in $dir (logging to $logfile)"
     tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
+    tmux pipe-pane -t "$session" -o "cat >> $logfile"
     tmux send-keys -t "$session" "git stash; git fetch origin; git checkout dev/claude-1 2>/dev/null || git checkout -b dev/claude-1; git pull origin dev/claude-1; claude" Enter
     tmux attach-session -t "$session"
   fi
+}
+
+# tread <repo> [slot] — read the scrollable log for a dev tmux session
+# tread ff      → opens log for first ff session in less
+# tread ff 2    → opens log for dev-ff-2
+tread() {
+  local repo="$1"
+  local slot="${2:-1}"
+
+  local -A repo_paths
+  repo_paths[ff]="$HOME/code/financial-forecast"
+  repo_paths[cfp]="$HOME/code/cashfwd-private"
+  repo_paths[cf]="$HOME/code/cashfwd"
+
+  if [[ -z "$repo" || -z "${repo_paths[$repo]}" ]]; then
+    echo "Usage: tread <ff|cfp|cf> [slot]"
+    # list available logs
+    echo "Available logs:"
+    ls "$HOME/.tmux-logs/" 2>/dev/null || echo "  (none)"
+    return 1
+  fi
+
+  local logfile="$HOME/.tmux-logs/dev-${repo}-${slot}.log"
+
+  if [[ ! -f "$logfile" ]]; then
+    echo "No log found: $logfile"
+    echo "(start a session with 'dev $repo $slot' first)"
+    return 1
+  fi
+
+  # open at bottom, follow live output, strip ANSI escape codes for readability
+  less -R +G "$logfile"
 }
