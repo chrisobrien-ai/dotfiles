@@ -94,18 +94,25 @@ tpaste() {
     echo "iCloud Drive not found at: $icloud"
     return 1
   fi
-  # find latest screenshot in iCloud Drive root
+  # find latest screenshot in iCloud Drive root.
+  # (N) is the nullglob qualifier: unmatched globs expand to nothing instead of
+  # raising zsh's "no matches found" error. Collect into an array first so an
+  # empty result never makes `ls` fall back to listing the current directory.
   local src
-  src=$(ls -t "$icloud"/Screenshot*.png "$icloud"/Screenshot*.jpg 2>/dev/null | head -1)
+  local -a imgs
+  imgs=("$icloud"/Screenshot*.png(N) "$icloud"/Screenshot*.jpg(N))
   # fall back to any image in root
-  if [[ -z "$src" ]]; then
-    src=$(ls -t "$icloud"/*.png "$icloud"/*.jpg "$icloud"/*.jpeg "$icloud"/*.heic 2>/dev/null | head -1)
+  if (( ${#imgs} == 0 )); then
+    imgs=("$icloud"/*.png(N) "$icloud"/*.jpg(N) "$icloud"/*.jpeg(N) "$icloud"/*.heic(N))
   fi
 
-  if [[ -z "$src" ]]; then
+  if (( ${#imgs} == 0 )); then
     echo "No images found in iCloud Drive ($icloud)"
     return 1
   fi
+
+  # newest by mtime
+  src=$(ls -t "${imgs[@]}" | head -1)
 
   echo "Using: $src"
 
