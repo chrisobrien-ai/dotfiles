@@ -18,6 +18,10 @@ jobs:
     name: Scorecard analysis
     runs-on: ubuntu-latest
     permissions:
+      # Job-level permissions REPLACE the workflow-level set (they don't merge),
+      # so every scope this job needs must be listed here or it defaults to none.
+      contents: read           # checkout needs this — without it, "Repository not found"
+      actions: read            # Scorecard's CI-tests / branch-protection checks
       security-events: write   # upload SARIF to the Security tab
       id-token: write          # publish results to the OpenSSF API
     steps:
