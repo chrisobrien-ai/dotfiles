@@ -19,7 +19,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest   # shellcheck is preinstalled on ubuntu runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Run shellcheck
         run: shellcheck install.sh bin/* .githooks/*
