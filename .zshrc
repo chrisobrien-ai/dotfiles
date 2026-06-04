@@ -774,9 +774,12 @@ emit([(s, '') for s in cands])                        # fallback: keyword order
 PY
 }
 
-# _claude_sessions_fzf [cwd] [query] — fzf-pick a saved Claude transcript.
-# Echoes the chosen row as "<session-id>\t<cwd>\t<display>" (fzf only shows the
-# display column). Newest-first by transcript mtime; the JSONL is parsed once in
+# _claude_session_rows [cwd] [query] — scan saved Claude transcripts, printing
+# one "<session-id>\t<cwd>\t<display>" row per session to stdout (no fzf — see
+# _claude_sessions_fzf for the picker). Split out so the rows can be generated on
+# a *remote* host over ssh and fzf'd locally (tbeam --here): fzf can't be driven
+# interactively through a captured ssh pipe, but a row dump travels fine.
+# Newest-first by transcript mtime; the JSONL is parsed once in
 # python for each file's real cwd (the `cwd` field, not the lossy folder name),
 # its title — preferring a /rename `customTitle`, then the generated `aiTitle`,
 # then the first human message. With a <cwd> arg, only sessions
@@ -785,20 +788,15 @@ PY
 # its title + your prompts; non-matches are dropped and the list is ranked by
 # relevance, then recency (this is what `tfind` drives). Returns nonzero on no
 # pick / no fzf.
-_claude_sessions_fzf() {
+_claude_session_rows() {
   # Diagnostics go to stderr: this function's stdout is captured by the caller's
   # $(...), so a stdout error would be swallowed silently instead of shown.
-  command -v fzf     >/dev/null 2>&1 || { echo "fzf not installed (brew install fzf)" >&2; return 1; }
   command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; return 1; }
   local projects="$HOME/.claude/projects"
   [[ -d $projects ]] || { echo "No Claude sessions at $projects" >&2; return 1; }
   local filter="${1:-}" query="${2:-}"
-  local prompt='resume claude (all) > '
-  [[ -n $filter ]] && prompt="resume claude (${filter:t}) > "
-  [[ -n $query  ]] && prompt="resume claude (search: $query) > "
 
-  python3 - "$projects" "$filter" "$query" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
-        --prompt="$prompt" --height=60% --reverse
+  python3 - "$projects" "$filter" "$query" <<'PY'
 import json, os, sys, glob, datetime
 root = sys.argv[1]
 filt = sys.argv[2] if len(sys.argv) > 2 else ''
@@ -870,6 +868,20 @@ for score, mtime, sid, cwd, short, title in rows:
     when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
     print(f"{sid}\t{cwd}\t{when}  {short:<18}  {title}")
 PY
+}
+
+# _claude_sessions_fzf [cwd] [query] — fzf-pick a saved Claude transcript, echoing
+# the chosen "<session-id>\t<cwd>\t<display>" row (fzf shows only the display
+# column). Thin picker over _claude_session_rows; all the scan/scoring logic lives
+# there. Returns nonzero on no pick / no fzf.
+_claude_sessions_fzf() {
+  command -v fzf >/dev/null 2>&1 || { echo "fzf not installed (brew install fzf)" >&2; return 1; }
+  local filter="${1:-}" query="${2:-}"
+  local prompt='resume claude (all) > '
+  [[ -n $filter ]] && prompt="resume claude (${filter:t}) > "
+  [[ -n $query  ]] && prompt="resume claude (search: $query) > "
+  _claude_session_rows "$filter" "$query" | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+        --prompt="$prompt" --height=60% --reverse
 }
 
 # _dev_resume_session <session> <dir> <session-id> — sibling of _dev_new_session:
@@ -1200,6 +1212,93 @@ _tbeam_sync_transcript() {
   rsync -az --update --exclude='.DS_Store' -e ssh "$src" "$host:.claude/projects/$enc/"
 }
 
+# _tbeam_pull_transcript <cwd> <host> — the mirror of _tbeam_sync_transcript: pull
+# a session's transcript dir FROM <host> down to here before it's resumed locally
+# (tbeam --here). Same conflict policy — rsync --update, no --delete — only the
+# direction flips, so the freshest copy of each file survives whichever way the
+# beam flows.
+_tbeam_pull_transcript() {
+  local cwd="$1" host="$2"
+  local enc="${cwd//\//-}"                          # /a/b → -a-b, Claude's dir scheme
+  local dst="$HOME/.claude/projects/$enc/"
+  mkdir -p "$dst"
+  rsync -az --update --exclude='.DS_Store' -e ssh "$host:.claude/projects/$enc/" "$dst"
+}
+
+# _tbeam_pull <host> [all] [fg] — the reverse beam: SUMMON a session that lives on
+# <host> down to THIS machine and land it here. Scans the host's transcripts over
+# ssh (its dotfiles define the same _claude_session_rows), fzf-picks locally,
+# rsync's the chosen transcript back, then resumes it here — a local tpush in
+# effect. --all widens the picker past $PWD; -f resumes in this terminal instead
+# of a detached dev slot.
+_tbeam_pull() {
+  local host="$1" all="$2" fg="$3"
+  command -v fzf >/dev/null 2>&1 || { echo "tbeam: fzf not installed (brew install fzf)" >&2; return 1; }
+
+  # Pull the HOST's session list (all projects), keep only real rows, then scope
+  # locally — the rows already carry each session's cwd as field 2, so $PWD
+  # filtering happens here and we dodge nested ssh-quoting entirely. Same path on
+  # every machine, so $PWD maps across hosts; --all shows every project.
+  local rows
+  rows=$(ssh "$host" "zsh -lic _claude_session_rows" 2>/dev/null | awk -F'\t' 'NF>=3 && $2 ~ /^\//')
+  [[ -n $rows && -z $all ]] && rows=$(print -r -- "$rows" | awk -F'\t' -v d="$PWD" '$2==d || index($2, d"/")==1')
+  if [[ -z $rows ]]; then
+    [[ -n $all ]] && echo "tbeam: no sessions found on $host" >&2 \
+                  || echo "tbeam: no sessions on $host under $PWD (use -a for every repo)" >&2
+    return 1
+  fi
+
+  local row
+  row=$(print -r -- "$rows" | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+        --prompt="beam from $host > " --height=60% --reverse) || return 1
+  [[ -n $row ]] || return 1
+  local sid=${row%%$'\t'*}
+  local cwd=${${row#*$'\t'}%%$'\t'*}
+
+  [[ -d $cwd ]] || { echo "tbeam: $cwd doesn't exist here — clone/sync the repo first." >&2; return 1; }
+
+  echo "⟳ Beaming ${sid[1,8]}… ($cwd) from $host → here"
+  _tbeam_pull_transcript "$cwd" "$host" || return 1
+
+  # Honor the one-live-owner invariant (see tpush): if this exact conversation is
+  # already running in a local dev slot, reuse it rather than spawning a second
+  # resumer on the same id (they'd diverge). _dev_resume_session stamps
+  # CLAUDE_RESUME_ID on each slot, so we match on that.
+  local existing s
+  for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+    if [[ "$(tmux show-environment -t "$s" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)" == "$sid" ]]; then
+      existing="$s"; break
+    fi
+  done
+
+  # -f: resume straight in this terminal (subshell exec so the terminal returns to
+  # your shell when Claude exits). If it's already live locally, attach instead.
+  if [[ -n $fg ]]; then
+    [[ -n $existing ]] && { echo "tbeam: already running locally in $existing — attaching."; tmux attach-session -t "$existing"; return; }
+    echo "✓ Resuming ${sid[1,8]}… here"
+    ( cd "$cwd" && exec claude -r "$sid" )
+    return
+  fi
+
+  # Default: land in a detached dev-<repo>-<slot> (reusing an existing one), then
+  # attach if we own a terminal. Inside Claude (no TTY) just print the hint.
+  local repo slot session
+  if [[ -n $existing ]]; then
+    session="$existing"
+  else
+    read -r repo slot < <(_dev_slot_for_cwd "$cwd")
+    [[ -n $repo && -n $slot ]] || { echo "tbeam: couldn't map $cwd to a dev slot" >&2; return 1; }
+    session="dev-${repo}-${slot}"
+    _dev_resume_session "$session" "$cwd" "$sid"
+  fi
+  echo "✓ Landed here as $session"
+  if [[ -t 1 && -z $CLAUDE_CODE_SESSION_ID ]]; then
+    tmux attach-session -t "$session"
+  else
+    echo "  Attach: tmux attach -t $session"
+  fi
+}
+
 # _tbeam_land — runs ON the destination host. It's defined in the shared dotfiles
 # (so it exists on every machine); the laptop invokes it over ssh with the work
 # passed in the environment: TB_CWD, TB_SID, TB_MODE (tmux|fg), TB_ATTACH.
@@ -1222,28 +1321,35 @@ _tbeam_land() {
   print -r -- "$session"                        # last line: caller reads it for the hint
 }
 
-# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [host] — teleport a Claude
-# session to another machine (default: $TBEAM_HOST) and resume it there.
-# Like tpush, but the session lands on <host> instead of local tmux:
-#   • From INSIDE Claude: grabs THIS conversation + $PWD (always detaches — a
-#     Bash subprocess has no TTY to ssh -t into; you get an attach hint instead).
-#   • From a plain shell: fzf-pick a session (scoped to $PWD; -a for every repo).
-# Default landing is a detached dev-<repo>-<slot> tmux session on <host>, then it
-# ssh's you straight in. Flags:
-#   -f/--fg      resume in the ssh foreground instead of tmux (dies if ssh drops)
-#   -d/--detach  leave it running on <host>, just print how to attach (no ssh -t)
-#   -p/--pick    force the picker even when a current session is detectable
-#   -a/--all     picker across every project
-# The session's repo must exist at the same path on <host> (yours all live in
-# ~/code on every machine); the transcript is rsync'd over before it resumes.
+# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [--here] [host] — teleport a
+# Claude session between this machine and another (default: $TBEAM_HOST).
+# Like tpush, but across machines. Two directions:
+#   • PUSH (default): send a session FROM here TO <host>, land it there.
+#       – From INSIDE Claude: grabs THIS conversation + $PWD (always detaches — a
+#         Bash subprocess has no TTY to ssh -t into; you get an attach hint).
+#       – From a plain shell: fzf-pick a session (scoped to $PWD; -a for every repo).
+#       Default landing is a detached dev-<repo>-<slot> on <host>; then it ssh's
+#       you straight in.
+#   • PULL (--here): the reverse — SUMMON a session that lives ON <host> down to
+#       here and land it locally. Always fzf-picks (over the host's sessions,
+#       scoped to $PWD; -a for every repo), then resumes it in a local dev slot.
+# Flags:
+#   -f/--fg      resume in the foreground instead of tmux (dies if the shell drops)
+#   -d/--detach  (push) leave it running on <host>, just print how to attach
+#   -p/--pick    (push) force the picker even when a current session is detectable
+#   -a/--all     picker across every project (both directions)
+#   --here       PULL from <host> to this machine instead of pushing away
+# The session's repo must exist at the same path on both machines (yours all live
+# in ~/code everywhere); the transcript is rsync'd across before it resumes.
 tbeam() {
-  local fg= detach= pick= all= host= a
+  local fg= detach= pick= all= here= host= a
   for a in "$@"; do
     case "$a" in
       -f|--fg)     fg=1 ;;
       -d|--detach) detach=1 ;;
       -p|--pick)   pick=1 ;;
       -a|--all)    pick=1; all=1 ;;
+      --here)      here=1 ;;
       -*)          echo "tbeam: unknown flag $a" >&2; return 1 ;;
       *)           host="$a" ;;
     esac
@@ -1254,6 +1360,12 @@ tbeam() {
     return 1
   fi
   command -v rsync >/dev/null 2>&1 || { echo "tbeam: rsync not found" >&2; return 1; }
+
+  # --here flips the direction: pull a session off <host> onto this machine.
+  if [[ -n $here ]]; then
+    _tbeam_pull "$host" "$all" "$fg"
+    return
+  fi
 
   # Resolve the session id + its working dir (mirrors tpush).
   local sid cwd
@@ -1409,7 +1521,7 @@ help() {
 _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
 _dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(--no-tmux)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
-_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all)' }
+_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here)' }
 compdef _dev_repos    dev
 compdef _ff_repos     tgo tpaste tread tplan tpop
 compdef _tbeam_args   tbeam
