@@ -12,6 +12,10 @@ DEV_REPOS[web]="$HOME/code/my-web"
 # Defaults to dev/claude-1 in ~/.zshrc; uncomment to use your own.
 # DEV_BRANCH=dev/agent
 
+# Per-repo branch overrides, keyed by the DEV_REPOS alias. A repo with no entry
+# uses $DEV_BRANCH. Use this for a repo whose workflow commits straight to main:
+# DEV_BRANCHES[dotfiles]=main
+
 # Default host for `tbeam` (teleport a Claude session to another machine).
 # Omit this to require an explicit host argument every time.
 # export TBEAM_HOST=my-remote

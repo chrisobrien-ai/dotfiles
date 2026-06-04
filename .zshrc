@@ -60,13 +60,22 @@ dots() {
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS
+typeset -gA DEV_REPOS DEV_BRANCHES
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
-# DEV_BRANCH — the branch `dev`/`_dev_new_session` check out (and create) when
-# starting a fresh Claude session. Override in ~/.zshrc.local; defaults here so
-# the committed config works standalone. `:=` lets the local file win if it set it.
+# DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
+# create) when starting a fresh Claude session. Override in ~/.zshrc.local;
+# defaults here so the committed config works standalone. `:=` lets the local
+# file win if it set it.
 : ${DEV_BRANCH:=dev/claude-1}
+
+# DEV_BRANCHES — per-repo branch overrides, keyed by the same alias as DEV_REPOS.
+# A repo with no entry falls back to $DEV_BRANCH; e.g. a repo whose workflow
+# commits straight to main wants DEV_BRANCHES[dotfiles]=main. Set in
+# ~/.zshrc.local (declared above so the local file can just add keys).
+# _dev_branch_for <repo> — branch `dev` uses for <repo>: its DEV_BRANCHES
+# override if set, else the global $DEV_BRANCH.
+_dev_branch_for() { print -r -- "${DEV_BRANCHES[$1]:-$DEV_BRANCH}" }
 
 # Generate a cd shortcut per repo: each key jumps straight to its dir.
 for _repo in ${(k)DEV_REPOS}; do
@@ -183,7 +192,7 @@ tpaste() {
 
   # new session → bootstrap Claude, wait for it to come up, queue the path, attach
   echo "Starting $session for the screenshot…"
-  _dev_new_session "$session" "${DEV_REPOS[$repo]}"
+  _dev_new_session "$session" "${DEV_REPOS[$repo]}" "$(_dev_branch_for "$repo")"
 
   # wait (up to ~30s) for Claude's process to take over the pane; if the
   # readiness check never matches this degrades to a plain 30s wait
@@ -380,11 +389,12 @@ tgo() {
   fi
 }
 
-# _dev_new_session <session> <dir> — create a detached tmux session in <dir>,
-# start logging, and launch Claude on the $DEV_BRANCH branch (default
-# dev/claude-1). Shared by `dev` and `tpaste` so the bootstrap (branch dance,
-# geometry, logging) lives in one place; callers attach (or not) and deliver
-# input themselves afterwards.
+# _dev_new_session <session> <dir> [branch] — create a detached tmux session in
+# <dir>, start logging, and launch Claude on <branch> (default $DEV_BRANCH).
+# Callers pass the repo's resolved branch (see _dev_branch_for) since the repo
+# alias isn't recoverable from <session> reliably. Shared by `dev` and `tpaste`
+# so the bootstrap (branch dance, geometry, logging) lives in one place; callers
+# attach (or not) and deliver input themselves afterwards.
 #
 # We *pre-assign* Claude's session id (a lowercased uuidgen) and pass it as
 # `claude --session-id`, then stash it on the tmux session as CLAUDE_RESUME_ID —
@@ -394,21 +404,23 @@ tgo() {
 # one. uuidgen is uppercase but Claude stores ids lowercase, so we lowercase to
 # keep the transcript filename glob (`<sid>.jsonl`) matching.
 _dev_new_session() {
-  local session="$1" dir="$2"
+  local session="$1" dir="$2" branch="${3:-$DEV_BRANCH}"
   local logfile="$HOME/.tmux-logs/${session}.log"
   local sid; sid="$(uuidgen | tr 'A-Z' 'a-z')"
   mkdir -p "$HOME/.tmux-logs"
   tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
   tmux pipe-pane -t "$session" -o "cat >> $logfile"
   tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
-  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $DEV_BRANCH 2>/dev/null || git checkout -b $DEV_BRANCH; git pull origin $DEV_BRANCH; claude --session-id $sid" Enter
+  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $branch 2>/dev/null || git checkout -b $branch; git pull origin $branch; claude --session-id $sid" Enter
 }
 
-# dev <repo> [slot] [--no-tmux] — open/reattach a Claude Code tmux session
+# dev <repo> [slot|new] [--no-tmux] — open/reattach a Claude Code tmux session
 # dev list | dev ls — show all dev sessions, marking attached + active context
 # repos: the keys of DEV_REPOS (configured in ~/.zshrc.local)
-# slot: optional 1-4, auto-picks next free slot if omitted
+# slot: optional 1-4, auto-picks next free/unattached slot if omitted
+# new: force a brand-new slot (next never-used number) instead of reattaching
 # --no-tmux: run the git setup + claude inline in this terminal, no tmux session
+# The branch checked out is per-repo (DEV_BRANCHES[<repo>], else $DEV_BRANCH).
 dev() {
   local no_tmux=
   local -a pos
@@ -431,7 +443,7 @@ dev() {
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "$repo" || -z "${DEV_REPOS[$repo]}" ]]; then
-    echo "Usage: dev <${(kj:|:)DEV_REPOS:-repo}> [slot] [--no-tmux]"
+    echo "Usage: dev <${(kj:|:)DEV_REPOS:-repo}> [slot|new] [--no-tmux]"
     echo "       dev list | dev ls   → show all sessions (attached + active context)"
     if (( ${#DEV_REPOS} )); then
       local _k
@@ -439,11 +451,13 @@ dev() {
     else
       echo "  (no repos configured — add them to ~/.zshrc.local; see .zshrc.local.example)"
     fi
+    echo "  new      → force a brand-new slot instead of reattaching"
     echo "  --no-tmux → run git setup + claude inline (no tmux session)"
     return 1
   fi
 
   local dir="${DEV_REPOS[$repo]}"
+  local branch="$(_dev_branch_for "$repo")"
 
   if [[ ! -d "$dir" ]]; then
     echo "Repo dir not found: $dir"
@@ -455,9 +469,17 @@ dev() {
   if [[ -n "$no_tmux" ]]; then
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
-    git stash; git fetch origin; git checkout $DEV_BRANCH 2>/dev/null || git checkout -b $DEV_BRANCH; git pull origin $DEV_BRANCH
+    git stash; git fetch origin; git checkout $branch 2>/dev/null || git checkout -b $branch; git pull origin $branch
     claude
     return
+  fi
+
+  # `dev <repo> new` — force the next never-used slot (skip reattaching to an
+  # existing unattached session); always spins up a fresh Claude.
+  if [[ "$slot" == new ]]; then
+    local n=1
+    while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do (( n++ )); done
+    slot=$n
   fi
 
   # auto-pick slot: find a free or unattached slot, or create the next one
@@ -491,7 +513,7 @@ dev() {
     tmux attach-session -t "$session"
   else
     echo "Starting $session in $dir (logging to $logfile)"
-    _dev_new_session "$session" "$dir"
+    _dev_new_session "$session" "$dir" "$branch"
     tmux attach-session -t "$session"
   fi
 }
@@ -1385,7 +1407,7 @@ help() {
 # helper names start with `_` so the `help` parser above skips them. (csync takes
 # no args, so it needs no completion.)
 _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
-_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' '*:flag:(--no-tmux)' }
+_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(--no-tmux)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
 _tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all)' }
 compdef _dev_repos    dev
