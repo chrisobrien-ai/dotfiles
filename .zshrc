@@ -39,8 +39,19 @@ prview() {
 # nosleep — keep the Mac awake until Ctrl-C (interactive; sleep-manager for background)
 nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
 
-# dots — pull latest dotfiles (origin's main HEAD) and reload zsh
-dots() { cd ~/code/dotfiles && git pull origin main && source ~/.zshrc && cd - > /dev/null; }
+# dots — fetch origin's main HEAD and reload zsh; fast-forward only, and only on main
+dots() {
+  cd ~/code/dotfiles || return
+  git fetch origin main || { cd - > /dev/null; return 1; }
+  local branch=$(git symbolic-ref --short -q HEAD)
+  if [[ "$branch" == main ]]; then
+    git merge --ff-only origin/main || print -u2 "dots: main has diverged from origin; not fast-forwarding"
+  else
+    print "dots: on '$branch', fetched origin/main but not merging (switch to main to fast-forward)"
+  fi
+  source ~/.zshrc
+  cd - > /dev/null
+}
 
 # DEV_REPOS — single source of truth for the repos `dev` and the cd shortcuts
 # below both understand. Add a repo here and it gains a `dev <key>` session AND a
@@ -900,21 +911,37 @@ _dev_slot_for_cwd() {
 
 # claude — thin wrapper around the real `claude` CLI that makes tpush's
 # "background this conversation" flow seamless. Before launching, it arms a
-# one-shot sentinel file (path passed to Claude via CLAUDE_TPUSH_ATTACH). If
-# tpush — run as /tpush from inside the session — writes a tmux session name
-# there, then the moment you leave Claude (/exit or Ctrl-D) we attach you
-# straight into that backgrounded session instead of dropping you at a bare
-# prompt. No sentinel written → behaves exactly like plain `claude`. tpush
-# can't do this itself: it runs in Claude's Bash subprocess, which has no TTY
-# to attach and can't exit its own parent — the attach must happen out here.
+# one-shot sentinel file (path passed to Claude via CLAUDE_TPUSH_ATTACH). When
+# tpush — run as /tpush from inside the session — writes an instruction there,
+# the wrapper acts on it the moment you leave Claude (/exit or Ctrl-D):
+#   • SPAWN<TAB>session<TAB>cwd<TAB>sid — resume $sid into a fresh detached tmux
+#     session, THEN attach. The spawn is deferred to here ON PURPOSE: doing it
+#     from inside the live session (as tpush used to) means two claude processes
+#     own $sid at once, and with no transcript lock they diverge — the
+#     backgrounded copy looks frozen. By the time this runs the foreground has
+#     fully exited, so $sid has exactly one owner.
+#   • ATTACH<TAB>session — the conversation was already backgrounded; just attach.
+# No sentinel written → behaves exactly like plain `claude`. The wrapper has to
+# own this: tpush runs in Claude's Bash subprocess, which has no TTY to attach
+# and can't exit (let alone outlive) its own parent.
 claude() {
   local sentinel="${TMPDIR:-/tmp}/claude-tpush-attach.$$"
   rm -f "$sentinel"
   CLAUDE_TPUSH_ATTACH="$sentinel" command claude "$@"
   local rc=$?
   if [[ -s "$sentinel" ]]; then
-    local target="$(<"$sentinel")"
+    local payload="$(<"$sentinel")"
     rm -f "$sentinel"
+    local verb="${payload%%$'\t'*}" rest="${payload#*$'\t'}" target cwd sid
+    case "$verb" in
+      SPAWN)
+        target="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+        cwd="${rest%%$'\t'*}"; sid="${rest#*$'\t'}"
+        tmux has-session -t "$target" 2>/dev/null || _dev_resume_session "$target" "$cwd" "$sid"
+        ;;
+      ATTACH) target="$rest" ;;
+      *)      target="$payload" ;;   # legacy: whole line is a bare session name
+    esac
     if [[ -n "$target" ]] && tmux has-session -t "$target" 2>/dev/null; then
       echo "Attaching to backgrounded $target…"
       exec tmux attach -t "$target"
@@ -986,12 +1013,22 @@ tpush() {
     attach_hint="Attach: tmux attach -t $session"
   fi
 
+  # Defer the resume spawn when we're inside Claude and the claude() wrapper is
+  # present to do it post-exit. Spawning `claude -r $sid` now — while THIS
+  # foreground Claude is still alive on $sid — puts two processes on one
+  # transcript with no lock, and they diverge (the backgrounded copy freezes).
+  # The wrapper spawns once we've exited and $sid is free; see claude() above.
+  local defer=
+  [[ -n $CLAUDE_CODE_SESSION_ID && -n $CLAUDE_TPUSH_ATTACH && -z $existing ]] && defer=1
+
   if [[ -n $existing ]]; then
     echo "This conversation is already backgrounded in $session."
   elif tmux has-session -t "$session" 2>/dev/null; then
     # _dev_slot_for_cwd picks a free slot, so this only trips on a race.
     echo "$session already exists for another session — ${attach_hint#Attach: }"
     return 1
+  elif [[ -n $defer ]]; then
+    echo "Will resume ${sid[1,8]}… into detached $session ($cwd) on exit."
   else
     _dev_resume_session "$session" "$cwd" "$sid"
     echo "Resumed ${sid[1,8]}… in detached $session ($cwd)"
@@ -999,18 +1036,26 @@ tpush() {
 
   # Land you in the session. Three cases:
   if [[ -z $CLAUDE_CODE_SESSION_ID ]]; then
-    # Plain-shell picker mode: we own a real terminal, so attach straight in.
+    # Plain-shell picker mode: we own a real terminal and the picked session
+    # isn't live, so spawn (above) + attach straight in. No overlap to worry about.
     echo "$attach_hint"
     tmux attach-session -t "$session"
   elif [[ -n $CLAUDE_TPUSH_ATTACH ]]; then
-    # Inside Claude via the claude() wrapper: can't attach from this Bash
-    # subprocess, so arm the one-shot sentinel — leaving Claude attaches for us.
-    print -r -- "$session" > "$CLAUDE_TPUSH_ATTACH"
+    # Inside Claude via the claude() wrapper: can't attach (or safely spawn) from
+    # this Bash subprocess, so hand the wrapper the intent. ATTACH for an already
+    # running copy; SPAWN (session+cwd+sid) so it resumes once we've exited.
+    if [[ -n $existing ]]; then
+      print -r -- "ATTACH"$'\t'"$session" > "$CLAUDE_TPUSH_ATTACH"
+    else
+      print -r -- "SPAWN"$'\t'"$session"$'\t'"$cwd"$'\t'"$sid" > "$CLAUDE_TPUSH_ATTACH"
+    fi
     echo "→ Type /exit (or Ctrl-D) and you'll drop into $session automatically."
   else
-    # Inside Claude, but launched without the wrapper (older shell): manual.
+    # Inside Claude without the wrapper (older shell): can't defer, so spawn now
+    # and warn — exit immediately, two live copies of one session diverge.
+    [[ -z $existing ]] && _dev_resume_session "$session" "$cwd" "$sid"
     echo "$attach_hint"
-    echo "(Exit this foreground Claude — the tmux copy now owns the conversation.)"
+    echo "(Exit this foreground Claude NOW — two live copies of one session diverge.)"
   fi
 }
 
@@ -1061,7 +1106,23 @@ tpop() {
   [[ -n $sid ]] || { echo "Couldn't find a session id for $session ($dir)."; return 1; }
 
   echo "Popping $session → foreground (claude -r ${sid[1,8]}… in $dir)"
+  # Capture the live claude PID inside the session so we can wait for it to fully
+  # exit before resuming. Claude Code takes NO lock on a session's transcript: if
+  # the old (tmux) process and the new (foreground) one are both live on $sid they
+  # each append to one .jsonl with no coordination, the conversation diverges, and
+  # the copy you aren't driving looks frozen. kill-session only sends SIGHUP, so
+  # the old claude needs a beat to trap it, flush, and exit — racing it here was
+  # the "popped session stops updating" bug.
+  local pane_pid cpid
+  pane_pid=$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [[ -n $pane_pid ]] && cpid=$(pgrep -P "$pane_pid" 2>/dev/null | head -1)   # claude = pane shell's child
   tmux kill-session -t "$session"
+  if [[ -n $cpid ]]; then
+    local n=0
+    while kill -0 "$cpid" 2>/dev/null && (( n++ < 100 )); do sleep 0.05; done   # wait ≤5s for it to die
+    kill -0 "$cpid" 2>/dev/null && \
+      echo "warning: $session's claude ($cpid) didn't exit; resuming anyway — transcript may interleave." >&2
+  fi
   cd "$dir" && claude -r "$sid"
 }
 
