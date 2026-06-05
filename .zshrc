@@ -511,9 +511,15 @@ _dev_list() {
 # a live Claude (active context) and <force> is empty, confirm first: killing only
 # SIGHUPs Claude and the transcript is appended live (so the conversation stays
 # resumable via tpop/dev), but we still guard against a typo dropping a live turn.
+# The confirm is gated on ACTIVE CONTEXT, not merely a live process: a claude
+# parked on its startup splash (_dev_session_at_welcome — what `dev ls` reports as
+# "idle — no conversation") has no conversation to interrupt, so kill it without
+# the prompt. Mirrors _dev_list's two-signal distinction; without it `dev kill`
+# prompted "Claude is live there" for the very sessions ls calls idle.
 _dev_kill_one() {
   local session="$1" force="$2"
-  if [[ -z "$force" ]] && _dev_session_has_claude "$session"; then
+  if [[ -z "$force" ]] && _dev_session_has_claude "$session" \
+       && ! _dev_session_at_welcome "$session"; then
     read -q "REPLY?Kill $session? Claude is live there (context interrupted). [y/N] " \
       || { print; echo "Skipped $session."; return 1; }
     print
@@ -1820,6 +1826,36 @@ tbeam() {
   fi
 }
 
+# mini — run a command on the mini (default: $MINI_HOST, else $TBEAM_HOST)
+#
+# Usage: mini [command...]
+#
+# Arguments:
+#   command...   command to run on the mini; omit to open an interactive shell
+#
+# Runs <command> on the mini over ssh in a login+interactive shell with a TTY, so
+# your dotfiles functions (dev, tgo, …), Homebrew PATH, and tmux all resolve there
+# — e.g. `mini dev dot` starts a dev session on the mini. With no command it just
+# drops you into a shell on it. Host comes from $MINI_HOST, falling back to
+# $TBEAM_HOST; set either in ~/.zshrc.local.
+mini() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for mini; return 0; }
+  local host="${MINI_HOST:-${TBEAM_HOST:-}}"
+  if [[ -z "$host" ]]; then
+    echo "mini: no host — set MINI_HOST (or TBEAM_HOST) in ~/.zshrc.local" >&2
+    return 1
+  fi
+  # No command: open an interactive login shell on the mini.
+  (( $# )) || { ssh -t "$host"; return; }
+  # Two quoting layers: (@q) quotes each arg so the remote zsh -c sees the original
+  # words, then (q) wraps the joined string as ONE token for ssh's transport (ssh
+  # otherwise re-splits its remote command on spaces). `zsh -lic` — login +
+  # interactive — is what makes dev/tgo/Homebrew/tmux resolve remotely, the same
+  # reason _tbeam_land runs under it.
+  local cmd="${(j: :)${(@q)@}}"
+  ssh -t "$host" "zsh -lic ${(q)cmd}"
+}
+
 # help — show this command list, grouped by purpose
 # Each command's name + description are parsed live from the leading
 # `# name … — description` comment above each ~/.zshrc function and the header
@@ -1867,7 +1903,7 @@ help() {
   # Grouping by purpose.  "Title:cmd cmd …" — drop a command's name into a group
   # to file it; anything uncategorized falls through to "Other" at the end.
   local -a groups=(
-    "Dotfiles & shell:dots help"
+    "Dotfiles & shell:dots help mini"
     "Git & PRs:prview"
     "Claude dev sessions (tmux):dev dev-list tgo tread tpaste tpush tpop tbeam tplan tfind ${(kj: :)DEV_REPOS}"
     "Claude session sync:csync"
