@@ -454,11 +454,13 @@ PY
 }
 
 # _dev_list — print every dev-<repo>-<slot> tmux session, compact enough to read
-# on a phone (Termius). One line per session: two status glyphs + short name +
-# what it's working on. The `dev-` prefix and the redundant "attached/detached"
-# word are dropped (the glyph already says it) and the full repo path is dropped
-# (it's in the name) so the line fits a narrow screen; the summary is truncated to
-# $COLUMNS so it never wraps. Glyphs:
+# on a phone (Termius). One line per session: a two-glyph STATUS field + short
+# name + what it's working on. The `dev-` prefix and the redundant
+# "attached/detached" word are dropped (the glyph already says it) and the full
+# repo path is dropped (it's in the name) so the line fits a narrow screen; the
+# summary is truncated to $COLUMNS so it never wraps. The two glyphs are
+# space-separated ("○ ✓", not "○✓") so the orthogonal states read as two columns,
+# under a STATUS header. Glyphs:
 #   ● attached / ○ detached   (any client viewing it)
 #   ✓ active context          a live claude that has actually loaded a conversation.
 #                             Blank for: a claude parked on its startup splash
@@ -478,11 +480,12 @@ _dev_list() {
   # widest short name (sans dev-) so the WORKING ON column lines up
   local s short name_w=7
   while IFS= read -r s; do short="${s#dev-}"; (( ${#short} > name_w )) && name_w=${#short}; done <<< "$names"
-  local avail=$(( ${COLUMNS:-80} - 6 - name_w ))
-  (( avail < 12 )) && avail=$(( 80 - 6 - name_w ))
+  # prefix before the summary = 2 (indent) + 8 (STATUS field) + name_w + 1 (gap)
+  local avail=$(( ${COLUMNS:-80} - 11 - name_w ))
+  (( avail < 12 )) && avail=$(( 80 - 11 - name_w ))
   print -r -- "dev sessions   ${g}●${r0} attached · ${c}✓${r0} active context"
   print -r -- ""
-  printf '  %s%-*s %s%s\n' "$y" $((3 + name_w)) 'SESSION' 'WORKING ON' "$r0"
+  printf '  %s%-8s%-*s %s%s\n' "$y" 'STATUS' $name_w 'SESSION' 'WORKING ON' "$r0"
   local state dir amark cmark summary
   while IFS= read -r s; do
     short="${s#dev-}"
@@ -499,7 +502,8 @@ _dev_list() {
       [[ -n $summary ]] || summary='(untitled session)'
     fi
     (( ${#summary} > avail )) && summary="${summary[1,avail-1]}…"
-    printf '  %s%s %-*s %s%s%s\n' "$amark" "$cmark" $name_w "$short" "$y" "$summary" "$r0"
+    # STATUS field (8 cols): "<amark> <cmark>" = 3 visible glyph cols + 5 pad
+    printf '  %s %s     %-*s %s%s%s\n' "$amark" "$cmark" $name_w "$short" "$y" "$summary" "$r0"
   done <<< "$names"
 }
 
