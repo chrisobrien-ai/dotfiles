@@ -1421,33 +1421,54 @@ _tbeam_pull_transcript() {
   rsync -az --update --exclude='.DS_Store' -e ssh "$host:.claude/projects/$enc/" "$dst"
 }
 
-# _tbeam_pull <host> [all] [fg] — the reverse beam: SUMMON a session that lives on
+# _tbeam_transcript_cwd <transcript.jsonl> — print the working dir a session ran
+# in, read from the first `"cwd"` line of its transcript (the real path, not the
+# lossy dash-encoded folder name). Used when `tbeam -s <id>` resolves an explicit
+# id locally and needs that session's cwd to verify it on the host and cd there.
+_tbeam_transcript_cwd() {
+  python3 - "$1" <<'PY'
+import json, sys
+for line in open(sys.argv[1], errors='ignore'):
+    if '"cwd"' in line:
+        try:
+            c = json.loads(line).get('cwd')
+            if c: print(c); break
+        except ValueError: pass
+PY
+}
+
+# _tbeam_pull <host> [all] [fg] [sid] — the reverse beam: SUMMON a session that lives on
 # <host> down to THIS machine and land it here. Scans the host's transcripts over
 # ssh (its dotfiles define the same _claude_session_rows), fzf-picks locally,
 # rsync's the chosen transcript back, stops the origin copy on <host> (the move —
 # see _tbeam_kill_owner), then resumes it here — a local tpush in effect. --all
 # widens the picker past $PWD; -f resumes in this terminal instead of a dev slot.
 _tbeam_pull() {
-  local host="$1" all="$2" fg="$3"
-  command -v fzf >/dev/null 2>&1 || { echo "tbeam: fzf not installed (brew install fzf)" >&2; return 1; }
+  local host="$1" all="$2" fg="$3" sid_arg="$4"
 
-  # Pull the HOST's session list (all projects), keep only real rows, then scope
-  # locally — the rows already carry each session's cwd as field 2, so $PWD
-  # filtering happens here and we dodge nested ssh-quoting entirely. Same path on
-  # every machine, so $PWD maps across hosts; --all shows every project.
+  # Pull the HOST's session list (all projects); each row is sid\tcwd\tdisplay.
   local rows
   rows=$(ssh "$host" "zsh -lic _claude_session_rows" 2>/dev/null | awk -F'\t' 'NF>=3 && $2 ~ /^\//')
-  [[ -n $rows && -z $all ]] && rows=$(print -r -- "$rows" | awk -F'\t' -v d="$PWD" '$2==d || index($2, d"/")==1')
-  if [[ -z $rows ]]; then
-    [[ -n $all ]] && echo "tbeam: no sessions found on $host" >&2 \
-                  || echo "tbeam: no sessions on $host under $PWD (use -a for every repo)" >&2
-    return 1
-  fi
+  [[ -n $rows ]] || { echo "tbeam: no sessions found on $host" >&2; return 1; }
 
   local row
-  row=$(print -r -- "$rows" | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
-        --prompt="beam from $host > " --height=60% --reverse) || return 1
-  [[ -n $row ]] || return 1
+  if [[ -n $sid_arg ]]; then
+    # -s <id>: pick the host session whose id starts with <id> (full or unique
+    # prefix), no picker, no $PWD scope — an explicit id is unambiguous on its own.
+    row=$(print -r -- "$rows" | awk -F'\t' -v id="$sid_arg" 'index($1, id)==1')
+    local matches; matches=$(print -r -- "$row" | grep -c .)
+    (( matches ))      || { echo "tbeam: no session on $host matching '$sid_arg'" >&2; return 1; }
+    (( matches == 1 )) || { echo "tbeam: '$sid_arg' matches $matches sessions on $host — use a longer prefix" >&2; return 1; }
+  else
+    # Picker path: scope to $PWD (rows carry cwd as field 2, so we filter locally
+    # and dodge nested ssh-quoting), then fzf. --all widens past $PWD.
+    command -v fzf >/dev/null 2>&1 || { echo "tbeam: fzf not installed (brew install fzf)" >&2; return 1; }
+    [[ -z $all ]] && rows=$(print -r -- "$rows" | awk -F'\t' -v d="$PWD" '$2==d || index($2, d"/")==1')
+    [[ -n $rows ]] || { echo "tbeam: no sessions on $host under $PWD (use -a for every repo)" >&2; return 1; }
+    row=$(print -r -- "$rows" | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+          --prompt="beam from $host > " --height=60% --reverse) || return 1
+    [[ -n $row ]] || return 1
+  fi
   local sid=${row%%$'\t'*}
   local cwd=${${row#*$'\t'}%%$'\t'*}
 
@@ -1549,7 +1570,7 @@ _tbeam_land() {
   print -r -- "$session"                        # last line: caller reads it for the hint
 }
 
-# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [--here] [host]
+# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [--here] [-s <id>] [host]
 # — teleport a Claude session between this machine and another (default: $TBEAM_HOST).
 # Like tpush, but across machines. It's a MOVE, not a copy: after the session
 # lands on the far side, tbeam stops the origin's live owner (the dev slot stamped
@@ -1573,21 +1594,30 @@ _tbeam_land() {
 #   -p/--pick    (push) force the picker even when a current session is detectable
 #   -a/--all     picker across every project (both directions)
 #   --here       PULL from <host> to this machine instead of pushing away
+#   -s/--session <id>  target a specific session by id (full, or a unique prefix
+#                like the 8 chars the picker shows) instead of fzf-picking — works
+#                in both directions. On push it's resolved against local
+#                transcripts; with --here, against the host's.
 # The session's repo must exist at the same path on both machines (yours all live
 # in ~/code everywhere); the transcript is rsync'd across before it resumes.
 tbeam() {
-  local fg= detach= pick= all= here= host= a
-  for a in "$@"; do
-    case "$a" in
-      -h|--help)   _help_for tbeam; return 0 ;;
-      -f|--fg)     fg=1 ;;
-      -d|--detach) detach=1 ;;
-      -p|--pick)   pick=1 ;;
-      -a|--all)    pick=1; all=1 ;;
-      --here)      here=1 ;;
-      -*)          echo "tbeam: unknown flag $a" >&2; return 1 ;;
-      *)           host="$a" ;;
+  # while/shift (not for-in) so -s/--session can consume the following token as
+  # its value; the `=`-joined forms (-s=… / --session=…) work too.
+  local fg= detach= pick= all= here= host= sid_arg=
+  while (( $# )); do
+    case "$1" in
+      -h|--help)            _help_for tbeam; return 0 ;;
+      -f|--fg)              fg=1 ;;
+      -d|--detach)          detach=1 ;;
+      -p|--pick)            pick=1 ;;
+      -a|--all)             pick=1; all=1 ;;
+      --here)               here=1 ;;
+      -s|--session|--id)    shift; sid_arg="$1" ;;
+      -s=*|--session=*|--id=*) sid_arg="${1#*=}" ;;
+      -*)                   echo "tbeam: unknown flag $1" >&2; return 1 ;;
+      *)                    host="$1" ;;
     esac
+    shift
   done
   host="${host:-${TBEAM_HOST:-}}"
   if [[ -z "$host" ]]; then
@@ -1598,15 +1628,31 @@ tbeam() {
 
   # --here flips the direction: pull a session off <host> onto this machine.
   if [[ -n $here ]]; then
-    _tbeam_pull "$host" "$all" "$fg"
+    _tbeam_pull "$host" "$all" "$fg" "$sid_arg"
     return
   fi
 
-  # Resolve the session id + its working dir (mirrors tpush).
-  local sid cwd
-  if [[ -n $CLAUDE_CODE_SESSION_ID && -z $pick ]]; then
+  # Resolve the session id + its working dir (mirrors tpush). Three ways:
+  #   • -s <id>  — an explicit id (full, or a unique prefix like the 8 chars the
+  #     picker/tbeam show): resolve it locally to its transcript + recorded cwd,
+  #     skipping both the picker and current-session mode. Lets you re-beam a
+  #     known id without picking.
+  #   • inside Claude (no -p) — THIS conversation + $PWD.
+  #   • otherwise — fzf-pick (scoped to $PWD; -a for every repo).
+  # self_move = "the origin is THIS foreground claude" (true current-session
+  # move): only then do we SIGTERM ourselves to complete the move. For any other
+  # origin (a dev slot) we kill-session it instead — see the two blocks below.
+  local sid cwd self_move=
+  if [[ -n $sid_arg ]]; then
+    setopt local_options null_glob
+    local -a tx=( "$HOME/.claude/projects"/*/"$sid_arg"*.jsonl )
+    (( ${#tx} ))      || { echo "tbeam: no local session matching '$sid_arg'" >&2; return 1; }
+    (( ${#tx} == 1 )) || { echo "tbeam: '$sid_arg' matches ${#tx} sessions — use a longer prefix" >&2; return 1; }
+    sid=${${tx[1]:t}%.jsonl}
+    cwd=$(_tbeam_transcript_cwd "$tx[1]")
+    [[ -n $cwd ]] || { echo "tbeam: couldn't read the working dir for $sid" >&2; return 1; }
+  elif [[ -n $CLAUDE_CODE_SESSION_ID && -z $pick ]]; then
     sid=$CLAUDE_CODE_SESSION_ID; cwd=$PWD          # current-session mode
-    detach=1                                        # no TTY in here to ssh -t into
   else
     local row filter="$PWD"
     [[ -n $all ]] && filter=""                      # --all: every project
@@ -1615,6 +1661,8 @@ tbeam() {
     sid=${row%%$'\t'*}
     cwd=${${row#*$'\t'}%%$'\t'*}
   fi
+  [[ $sid == "$CLAUDE_CODE_SESSION_ID" && -n $CLAUDE_CODE_SESSION_ID ]] && self_move=1
+  [[ -n $CLAUDE_CODE_SESSION_ID ]] && detach=1      # no TTY in Claude's Bash subprocess to ssh -t into
   [[ -d $cwd ]] || { echo "tbeam: session's directory no longer exists: $cwd" >&2; return 1; }
 
   # The far side resumes by cd'ing into the same path — bail early if it's absent.
@@ -1628,13 +1676,14 @@ tbeam() {
 
   # It's a MOVE, not a copy: now that the transcript is on $host, stop the origin
   # (here) so the id has one live owner. Two cases for "the origin":
-  #   • picker mode — the session may be live in a LOCAL dev slot; kill it (we're
-  #     in a plain shell, not attached to it, so this is safe). Done now, before
-  #     the blocking ssh -t branches below take over the terminal.
-  #   • current-session mode (inside Claude) — the origin is THIS foreground
-  #     claude, not a dev slot, so we can't kill-session it; instead we SIGTERM it
-  #     at the very end (see the detached branch), mirroring tpush's auto-exit.
-  if [[ -z $CLAUDE_CODE_SESSION_ID ]]; then
+  #   • a LOCAL dev slot (picker mode, or an -s id that's live in a slot) — kill it
+  #     now, before the blocking ssh -t branches below take over the terminal. We
+  #     aren't attached to it, so this is safe. (self_move excludes the case where
+  #     that slot is the very claude we're running inside.)
+  #   • THIS foreground claude (self_move — a current-session move) — can't
+  #     kill-session it; instead we SIGTERM it at the very end (see the detached
+  #     branch), mirroring tpush's auto-exit.
+  if [[ -z $self_move ]]; then
     local killed; killed=$(TB_SID=$sid _tbeam_kill_owner)
     [[ $killed == dev-* ]] && echo "✂ Stopped the local copy ($killed) — moved to $host"
   fi
@@ -1665,13 +1714,14 @@ tbeam() {
     echo "  Attach: ssh $host -t \"zsh -lic 'tmux attach -t $session'\""
   fi
 
-  # current-session move (inside Claude): the origin is THIS foreground claude, so
-  # the kill-block up top skipped it. Now that the session is live on $host, exit
-  # here so the id keeps one owner — mirrors tpush's auto-exit: SIGTERM the
-  # controlling claude (it flushes and quits in ~2s; transcript is appended live,
-  # so only the in-flight turn is lost). The hints above are already flushed. If
-  # the process can't be found, fall back to asking for a manual /exit.
-  if [[ -n $CLAUDE_CODE_SESSION_ID ]]; then
+  # current-session move (self_move): the origin is THIS foreground claude, so the
+  # kill-block up top skipped it. Now that the session is live on $host, exit here
+  # so the id keeps one owner — mirrors tpush's auto-exit: SIGTERM the controlling
+  # claude (it flushes and quits in ~2s; transcript is appended live, so only the
+  # in-flight turn is lost). The hints above are already flushed. If the process
+  # can't be found, fall back to asking for a manual /exit. (An explicit -s id that
+  # isn't our own session is NOT self_move, so we never kill the wrong claude.)
+  if [[ -n $self_move ]]; then
     local cpid; cpid=$(_tpush_claude_pid)
     if [[ -n $cpid ]]; then
       echo "Moved to $host — exiting this copy so it has one owner."
@@ -1786,7 +1836,7 @@ help() {
 _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
 _dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(--no-tmux)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
-_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here -h --help)' }
+_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here -s --session --id -h --help)' }
 compdef _dev_repos    dev
 compdef _ff_repos     tgo tpaste tread tplan tpop
 compdef _tbeam_args   tbeam
