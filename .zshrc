@@ -5,20 +5,64 @@ export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 # undefined and sourcing such a completion errors with "command not found: compdef".
 autoload -Uz compinit && compinit
 
-# _help_for <name> — print the doc-comment block that sits directly above the
-# zsh function <name> in this file, with the leading "# " stripped. The comment
-# that already documents each command IS its help text, so there's a single
-# source of truth: every command's `-h`/`--help` flag just calls this. Captures
-# only the contiguous `#` lines immediately preceding `name() {` (a blank line or
-# the previous function's `}` resets the block), and exits nonzero if none found.
+# _help_for <name> — render the doc-comment block directly above the zsh function
+# <name> as styled help. The comment that documents each command IS its help text,
+# so there's a single source of truth: every command's `-h`/`--help` just calls
+# this. Captures only the contiguous `#` lines immediately preceding `name() {`; a
+# *blank* line resets the block (a bare `#` is kept as a spacer), so design
+# rationale can sit above the help separated by one empty line. The renderer styles
+# a light, gh-style convention — write plain text in the comment, get structure for
+# free:
+#   line 1                     "<name> — <tagline>"     → name bold
+#   Usage: …                   the "Usage:" label bold
+#   Word:                      a capitalized word + colon on its own line → header
+#   <2sp><term>  <2+sp><desc>  two-column row → term cyan, desc dim, auto-aligned
+#   anything else              printed verbatim (paragraphs, blank spacer lines)
+# Color is emitted only when stdout is a TTY (so `cmd -h | cat` stays plain).
 _help_for() {
   local name="${1:?_help_for: need a function name}"
+  local b='' d='' c='' r=''
+  [[ -t 1 ]] && { b=$'\e[1m' d=$'\e[2m' c=$'\e[36m' r=$'\e[0m'; }
   awk -v fn="$name" '
     /^#/                  { blk = blk $0 ORS; next }
     $0 ~ "^" fn "\\(\\)"  { printf "%s", blk; found = 1; exit }
                           { blk = "" }
     END                   { exit !found }
-  ' ~/.zshrc | sed 's/^# \{0,1\}//'
+  ' ~/.zshrc | sed 's/^# \{0,1\}//' | awk -v b="$b" -v d="$d" -v c="$c" -v r="$r" '
+    # Pass 1: buffer every line, detecting two-column rows and the widest term so
+    # descriptions can align to a common column regardless of comment spacing.
+    {
+      raw[NR] = $0
+      if ($0 ~ /^  [^ ]/) {
+        body = substr($0, 3)
+        if (match(body, / {2,}/)) {
+          iskv[NR]  = 1
+          kterm[NR] = substr(body, 1, RSTART - 1)
+          kdesc[NR] = substr(body, RSTART + RLENGTH)
+          if (length(kterm[NR]) > maxw) maxw = length(kterm[NR])
+        }
+      }
+    }
+    # Pass 2: classify and colorize each line.
+    END {
+      for (n = 1; n <= NR; n++) {
+        line = raw[n]
+        if (n == 1 && index(line, " — ")) {
+          i = index(line, " — ")
+          printf "%s%s%s%s\n", b, substr(line, 1, i - 1), r, substr(line, i)
+        } else if (iskv[n]) {
+          printf "  %s%s%s%*s%s%s%s\n", \
+            c, kterm[n], r, maxw - length(kterm[n]) + 2, "", d, kdesc[n], r
+        } else if (line ~ /^Usage:/) {
+          printf "%s%s%s%s\n", b, "Usage:", r, substr(line, 7)
+        } else if (line ~ /^[A-Z][A-Za-z]*:$/) {
+          printf "%s%s%s\n", b, line, r
+        } else {
+          print line
+        }
+      }
+    }
+  '
 }
 
 # --- ssh-agent: one persistent agent reachable from every shell ----------
@@ -35,9 +79,14 @@ if [ $? -eq 2 ]; then            # 2 = no agent reachable (1 = up but no keys)
   ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null 2>&1
 fi
 
-# prview [pr#] — quick PR status: mergeability, merge state, per-check verdicts
-# (no arg → current branch's PR). Hides body/comments/diff; shows just
-# mergeability, merge state, and per-check verdicts.
+# prview — PR status at a glance: mergeability, merge state, per-check verdicts
+#
+# Usage: prview [pr#]
+#
+#   pr#   PR number to inspect; omit to use the current branch's PR
+#
+# Hides body/comments/diff — shows just mergeability, merge state, and per-check
+# counts (pass/fail/neutral/pending) plus a sorted per-check verdict list.
 prview() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for prview; return 0; }
   gh pr view "$@" --json mergeable,mergeStateStatus,statusCheckRollup | jq '
@@ -53,14 +102,22 @@ prview() {
   '
 }
 
-# nosleep — keep the Mac awake until Ctrl-C (interactive; sleep-manager for background)
+# nosleep — keep the Mac awake until Ctrl-C (interactive)
+#
+# Usage: nosleep
+#
+# Blocks sleep via `pmset disablesleep 1` + a foreground caffeinate, restoring on
+# exit/Ctrl-C. For a backgrounded, persistent block use `sleep-manager` instead.
 nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }; trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
 
-# dots — fetch origin's main HEAD and reload zsh. Fast-forwards whatever branch
-# we're on to origin/main — true on main, and on a dev branch (dev/claude-1) that
-# sits at/behind main, which is the normal state under the dev workflow. --ff-only
-# makes this safe: if the branch has its own commits ahead, or local edits would
-# be overwritten, the merge aborts untouched and we just reload.
+# dots — fast-forward dotfiles to origin/main and reload zsh
+#
+# Usage: dots
+#
+# Fetches origin/main and `git merge --ff-only` onto the current branch, then
+# re-sources ~/.zshrc. --ff-only keeps it safe: if the branch is ahead/diverged or
+# local edits would be overwritten, the merge aborts untouched and it just reloads.
+# Works from main or any dev branch that sits at/behind main (the dev-workflow norm).
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
   cd ~/code/dotfiles || return
@@ -141,9 +198,15 @@ _tpaste_claude_ready() {
   return 1
 }
 
-# tpaste [repo] [slot] — paste latest iCloud Drive image path into a dev tmux session
-# tpaste ff     → start a new ff session and queue the path into it
-# tpaste ff 3   → paste into dev-ff-3 (creating it if it doesn't exist)
+# tpaste — paste the latest iCloud Drive screenshot path into a dev tmux session
+#
+# Usage: tpaste <repo> [slot]
+#
+# Commands:
+#   tpaste ff       start a new ff session and queue the path into it
+#   tpaste ff 3     paste into dev-ff-3 (creating it if it doesn't exist)
+#
+# Grabs the newest image in iCloud Drive; press Enter in the session to send it.
 tpaste() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tpaste; return 0; }
   local repo="${1:-ff}"
@@ -501,10 +564,14 @@ _dev_kill() {
   _dev_kill_one "$session" "$force"
 }
 
-# tgo [repo] [slot] — attach to an existing dev tmux session
-# tgo        → list all dev sessions (with attached state)
-# tgo ff     → attach to first ff session
-# tgo ff 3   → attach to dev-ff-3
+# tgo — attach to an existing dev tmux session
+#
+# Usage: tgo [repo] [slot]
+#
+# Commands:
+#   tgo            list all dev sessions (with attached state)
+#   tgo ff         attach to the first ff session
+#   tgo ff 3       attach to dev-ff-3
 tgo() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tgo; return 0; }
   local repo="$1"
@@ -579,16 +646,21 @@ _dev_new_session() {
   tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $branch 2>/dev/null || git checkout -b $branch; git pull origin $branch; claude --session-id $sid" Enter
 }
 
-# dev <repo> [slot|new] [--no-tmux] — open/reattach a Claude Code tmux session
-# dev list | dev ls — show all dev sessions, marking attached + active context
-# dev kill <repo> <slot|all> [-f] — tear down a session (or all of a repo's);
-#   confirms when Claude is live unless -f; matches session names, so it also
-#   reaches orphaned sessions whose repo alias is gone (dev kill dotfiles 1).
-# repos: the keys of DEV_REPOS (configured in ~/.zshrc.local)
-# slot: optional 1-4, auto-picks next free/unattached slot if omitted
-# new: force a brand-new slot (next never-used number) instead of reattaching
-# --no-tmux: run the git setup + claude inline in this terminal, no tmux session
-# The branch checked out is per-repo (DEV_BRANCHES[<repo>], else $DEV_BRANCH).
+# dev — open/reattach a Claude Code tmux session
+#
+# Usage: dev <repo> [slot|new] [--no-tmux]
+#
+# Commands:
+#   dev <repo> [slot|new]        open/reattach (slot 1-4, or 'new' to force fresh)
+#   dev list | ls                list all dev sessions (attached + active context)
+#   dev kill <repo> <slot|all>   tear down a session  [-f to skip the confirm]
+#
+# Options:
+#   --no-tmux   run git setup + claude inline, no tmux session
+#
+# repo is a key of DEV_REPOS (configured in ~/.zshrc.local). The checked-out branch
+# is per-repo (DEV_BRANCHES[repo], else $DEV_BRANCH). dev kill matches session names,
+# so it also reaches orphaned sessions whose repo alias is gone (dev kill dotfiles 1).
 dev() {
   local no_tmux= force=
   local -a pos
@@ -697,9 +769,13 @@ dev() {
   fi
 }
 
-# tread <repo> [slot] — read the scrollable log for a dev tmux session
-# tread ff      → opens log for first ff session in less
-# tread ff 2    → opens log for dev-ff-2
+# tread — read the scrollable log for a dev tmux session
+#
+# Usage: tread <repo> [slot]
+#
+# Commands:
+#   tread ff       open the log for the first ff session in less
+#   tread ff 2     open the log for dev-ff-2
 tread() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tread; return 0; }
   local repo="$1"
@@ -732,16 +808,19 @@ tread() {
     | less -R +G
 }
 
-# tplan [repo|session] [slot] | [--all] — render the plan a Claude session wrote
-# Resolves a session the same way the dev/tgo/tpop family does, then renders the
-# plan that session saved. glow word-wraps for narrow mobile terminals (Termius);
-# falls back to less.
-#   tplan            → inside Claude: THIS session; else fzf-pick scoped to $PWD
-#   tplan ff 1       → the session running in tmux dev-ff-1
-#   tplan dev-cf-2   → that tmux session by full name
-#   tplan --all      → fzf-pick across every project
-# Sessions name their plan by an absolute ~/.claude/plans/<slug>.md path in the
-# transcript; we grab the LAST one referenced (the plan as finally written).
+# tplan — render the plan a Claude session wrote
+#
+# Usage: tplan [repo|session] [slot] | --all
+#
+# Commands:
+#   tplan            inside Claude: THIS session; else fzf-pick scoped to $PWD
+#   tplan ff 1       the session running in tmux dev-ff-1
+#   tplan dev-cf-2   that tmux session by full name
+#   tplan --all      fzf-pick across every project
+#
+# Resolves a session like the dev/tgo/tpop family, then renders the last plan it
+# saved (an absolute ~/.claude/plans/<slug>.md path in the transcript). glow
+# word-wraps for narrow mobile terminals (Termius), falling back to less.
 tplan() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tplan; return 0; }
   local sid
@@ -805,18 +884,18 @@ tplan() {
   fi
 }
 
-# tfind [-k] <query…> — find the Claude session working on something you describe.
-# Semantic search, not grep: a keyword pass over titles + your prompts gathers a
-# candidate pool (padded with recent sessions when your wording barely matches,
-# so divergent phrasing still gets a shot), then Sonnet reads each candidate's
-# title + opening prompts and ranks the genuinely-relevant ones, each tagged with
-# a one-line reason. The ranked shortlist drops into fzf; your pick
-# foreground-resumes there — the same `cd <dir> && claude -r <sid>` landing as
-# tpop. Falls back to plain keyword ranking if the claude CLI is unreachable.
-#   tfind redesign the portfolio tab     → the session doing that, even if it
-#                                           never used the word "redesign"
-#   tfind -k pine ema swing              → skip Sonnet, fast offline keyword rank
-# Searches every project (use tgo/tpush/tpop when you already know the dir/slot).
+# tfind — find the Claude session working on something you describe
+#
+# Usage: tfind [-k] <query…>
+#
+# Options:
+#   -k, --keyword   skip Sonnet; fast offline keyword ranking (works with no CLI)
+#
+# Semantic search, not grep: a keyword pass over titles + your prompts gathers
+# candidates (padded with recent sessions so divergent phrasing still gets a shot),
+# then Sonnet ranks the genuinely-relevant ones and your fzf pick foreground-resumes
+# (the same landing as tpop). Falls back to keyword order if the claude CLI is
+# unreachable. Searches every project — use tgo/tpush/tpop when you know the slot.
 tfind() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tfind; return 0; }
   local keyword=
@@ -1193,14 +1272,18 @@ _tpush_claude_pid() {
   return 1
 }
 
-# tpush [-p] [--all] — push a Claude session into a detached background tmux session
-# Resumes via `claude -r`, named to fit the dev/tgo/tread family.
-#   • Run from INSIDE Claude (CLAUDE_CODE_SESSION_ID set): grabs THIS session +
-#     $PWD automatically — this is how `/tmux` backgrounds the current chat.
-#   • Run from a plain shell: fzf-pick a session. The picker is scoped to the
-#     current directory's sessions; pass --all to list every project.
-#   • -p / --pick: force the picker even when a current session is detectable.
-# Attach afterward with the printed command. Refusing to nest if already in tmux.
+# tpush — push a Claude session into a detached background tmux session
+#
+# Usage: tpush [-p] [-a]
+#
+# Options:
+#   -p, --pick   force the picker even when a current session is detectable
+#   -a, --all    picker across every project (default: scoped to $PWD)
+#
+# Inside Claude (CLAUDE_CODE_SESSION_ID set): grabs THIS session + $PWD — how /tmux
+# backgrounds the current chat. From a plain shell: fzf-pick a session. Resumes via
+# `claude -r` into a dev-named slot; attach with the printed command. Refuses to
+# nest when already in tmux. Inverse of tpop.
 tpush() {
   local pick= all= a
   for a in "$@"; do
@@ -1317,12 +1400,17 @@ tpush() {
   fi
 }
 
-# tpop [repo|session] [slot] — migrate a tmux'd Claude session back to foreground
-# Kills the tmux session and resumes its conversation here with `claude -r` —
-# the inverse of tpush. Run from a plain shell, not inside the session you pop.
-#   tpop            → the dev session for the current dir
-#   tpop ff 3       → dev-ff-3
-#   tpop dev-cf-1   → that session by full name
+# tpop — pull a tmux'd Claude session back to the foreground
+#
+# Usage: tpop [repo|session] [slot]
+#
+# Commands:
+#   tpop            the dev session for the current dir
+#   tpop ff 3       dev-ff-3
+#   tpop dev-cf-1   that session by full name
+#
+# Kills the tmux session and resumes its conversation here with `claude -r` (the
+# inverse of tpush). Run from a plain shell, not inside the session you're popping.
 tpop() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tpop; return 0; }
   local session
@@ -1570,36 +1658,27 @@ _tbeam_land() {
   print -r -- "$session"                        # last line: caller reads it for the hint
 }
 
-# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [--here] [-s <id>] [host]
-# — teleport a Claude session between this machine and another (default: $TBEAM_HOST).
-# Like tpush, but across machines. It's a MOVE, not a copy: after the session
-# lands on the far side, tbeam stops the origin's live owner (the dev slot stamped
-# with that id, or — when run from inside Claude — this foreground claude itself)
-# so exactly one live claude owns the id. Two live owners of one transcript have
-# no lock and diverge; this is the same invariant tpush/tpop protect. Two directions:
-#   • PUSH (default): send a session FROM here TO <host>, land it there, stop it here.
-#       – From INSIDE Claude: grabs THIS conversation + $PWD (always detaches — a
-#         Bash subprocess has no TTY to ssh -t into), lands it on <host>, then
-#         SIGTERMs this copy so the move completes (like tpush's auto-exit).
-#       – From a plain shell: fzf-pick a session (scoped to $PWD; -a for every repo).
-#       Default landing is a detached dev-<repo>-<slot> on <host>; then it ssh's
-#       you straight in (with -d, it just prints how to attach).
-#   • PULL (--here): the reverse — SUMMON a session that lives ON <host> down to
-#       here, stop the copy on <host>, and land it locally. Always fzf-picks (over
-#       the host's sessions, scoped to $PWD; -a for every repo), into a local slot.
-# Flags:
-#   -f/--fg      resume in the foreground instead of tmux (no tmux dev slot; dies
-#                if the shell drops). Needs a terminal — not usable inside Claude.
-#   -d/--detach  (push) leave it running on <host>, just print how to attach
-#   -p/--pick    (push) force the picker even when a current session is detectable
-#   -a/--all     picker across every project (both directions)
-#   --here       PULL from <host> to this machine instead of pushing away
-#   -s/--session <id>  target a specific session by id (full, or a unique prefix
-#                like the 8 chars the picker shows) instead of fzf-picking — works
-#                in both directions. On push it's resolved against local
-#                transcripts; with --here, against the host's.
-# The session's repo must exist at the same path on both machines (yours all live
-# in ~/code everywhere); the transcript is rsync'd across before it resumes.
+# tbeam — teleport a Claude session between machines (default: $TBEAM_HOST)
+#
+# Usage: tbeam [flags] [host]
+#
+# Options:
+#   -f, --fg            resume in the foreground, no tmux slot (dies if the shell
+#                       drops; needs a terminal, so not usable from inside Claude)
+#   -d, --detach        (push) leave it running on <host>, just print how to attach
+#   -p, --pick          (push) force the picker even when a session is detectable
+#   -a, --all           picker across every project (both directions)
+#   --here              PULL from <host> to this machine instead of pushing away
+#   -s, --session <id>  target a session by id or unique prefix (both directions),
+#                       instead of fzf-picking
+#
+# Like tpush, but across machines — and a MOVE, not a copy: after the session lands
+# on the far side, the origin's live owner is stopped so exactly one claude owns the
+# id (the same invariant tpush/tpop protect). PUSH (default) sends THIS conversation
+# — or an fzf pick — to <host> and lands it in a detached dev slot there, then ssh's
+# you in. --here is the reverse: SUMMON a session from <host> down to here. The repo
+# must exist at the same ~/code path on both; the transcript is rsync'd before it
+# resumes.
 tbeam() {
   # while/shift (not for-in) so -s/--session can consume the following token as
   # its value; the `=`-joined forms (-s=… / --session=…) work too.
