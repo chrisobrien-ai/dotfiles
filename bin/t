@@ -261,6 +261,46 @@ def cmd_read(cfg, args):
     return 0
 
 
+def _delegate(snippet):
+    """exec the existing zsh implementation (login+interactive). For subprocess-safe
+    verbs whose battle-tested logic stays in zsh during the hybrid migration; these
+    end in a pager / tmux send-keys / tmux kill, all child-safe. (At hard cutover the
+    target functions are renamed to internal _t_* helpers and these snippets follow.)"""
+    os.execvp("zsh", ["zsh", "-lic", snippet])
+
+
+def cmd_plan(cfg, args):
+    parts = ["tplan"]
+    if args.all:
+        parts.append("--all")
+    if args.repo:
+        parts.append(shlex.quote(args.repo))
+    if args.slot:
+        parts.append(shlex.quote(args.slot))
+    _delegate(" ".join(parts))
+
+
+def cmd_paste(cfg, args):
+    parts = ["tpaste"]
+    if args.repo:
+        parts.append(shlex.quote(args.repo))
+    if args.slot:
+        parts.append(shlex.quote(args.slot))
+    _delegate(" ".join(parts))
+
+
+def cmd_kill(cfg, args):
+    # remote kill = `dev -r kill <repo> [slot]`; local = `dev kill <repo> <slot|all>`
+    parts = ["dev", "-r", "kill"] if args.remote else ["dev", "kill"]
+    if args.repo:
+        parts.append(shlex.quote(args.repo))
+    if args.slot:
+        parts.append(shlex.quote(args.slot))
+    if args.yes:
+        parts.append("-y")
+    _delegate(" ".join(parts))
+
+
 def _read_usage(cfg):
     repos = "|".join(cfg.repos) or "repo"
     print(f"t read — open a dev slot's tmux log in less\n")
@@ -280,8 +320,7 @@ def _read_usage(cfg):
 
 _PENDING = {
     "open": "dev <repo> [slot]", "fg": "dev <repo> fg", "pop": "tpop",
-    "push": "tpush", "beam": "tbeam", "plan": "tplan", "paste": "tpaste",
-    "find": "tfind", "kill": "dev kill", "land": "(internal)",
+    "push": "tpush", "beam": "tbeam", "find": "tfind", "land": "(internal)",
     "kill-owner": "(internal)", "__resolve": "(internal)",
 }
 
@@ -371,6 +410,7 @@ def build_parser():
 
 IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
+    "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill,
 }
 
 
