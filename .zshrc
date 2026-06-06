@@ -557,6 +557,64 @@ _dev_fg_rows() {
   for f in "$reg"/*(N.); do bpid=${f:t}; [[ -z ${live[$bpid]} ]] && rm -f "$f"; done
 }
 
+# _dev_pid_for_sid <sid> — print the live `claude` pid that owns session <sid>, via
+# the claude-stamp-tmux registry (~/.cache/claude-sessions/<pid> = "<sid>\t<cwd>").
+# The reverse of _dev_fg_rows' pid→sid read: _dev_adopt_fg needs the pid to STOP the
+# foreground owner before resuming. Empty if no live pid maps to <sid> (already gone
+# → resuming is safe anyway). A `-` sid (pre-registry) never matches, by design.
+_dev_pid_for_sid() {
+  local sid="$1" reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions" f bsid bcwd
+  [[ -n $sid && $sid != - ]] || return 1
+  for f in "$reg"/*(N.); do
+    IFS=$'\t' read -r bsid bcwd < "$f"
+    [[ $bsid == $sid ]] && kill -0 ${f:t} 2>/dev/null && { print -r -- ${f:t}; return 0; }
+  done
+  return 1
+}
+
+# _dev_adopt_fg <repo> — reattach a FOREGROUND (:fg) session for <repo> by MOVING it
+# here. A foreground claude is bound to its own terminal (no tmux to attach to), so
+# the only way to "get into it" from elsewhere is to stop that owner and resume the
+# conversation in THIS terminal — matching how it is running (the tmux-slot analog is
+# plain `dev <repo> <slot>` / `dev -r … --here`). One-live-owner: Claude takes no
+# transcript lock, so two live resumers of one id diverge — hence the SIGTERM-then-
+# wait before `claude -r`, mirroring tpop. Only :fg rows whose id the registry
+# recorded (sid != `-`) are resumable; a pre-registry one must be reattached from its
+# own terminal. Several :fg for one repo → fzf-pick (needs a TTY).
+_dev_adopt_fg() {
+  local repo="$1"
+  local rows; rows=$(_dev_fg_rows 2>/dev/null | awk -F'\t' -v r="${repo}:fg" '$3==r')
+  [[ -n $rows ]] || { echo "dev: no foreground claude running for '$repo' (see \`dev ls\`)." >&2; return 1; }
+  local resumable; resumable=$(print -r -- "$rows" | awk -F'\t' '$1!="-"')
+  [[ -n $resumable ]] || { echo "dev: foreground claude for '$repo' predates the session registry (no id recorded) — reattach from its own terminal." >&2; return 1; }
+  local sid cwd
+  local -a lines=( ${(f)resumable} )
+  if (( ${#lines} == 1 )); then
+    IFS=$'\t' read -r sid cwd _ <<< "${lines[1]}"
+  else
+    [[ -t 0 && -t 1 ]] || { echo "dev: several foreground sessions for '$repo' — pick from a terminal:" >&2; print -r -- "$resumable" | cut -f6 >&2; return 1; }
+    local pick
+    pick=$(print -r -- "$resumable" | awk -F'\t' '{printf "%s\t%s\n", $1, $6}' \
+             | fzf --with-nth=2.. --delimiter='\t' --prompt="adopt $repo:fg > ") || return 1
+    sid=${pick%%$'\t'*}
+    cwd=$(print -r -- "$resumable" | awk -F'\t' -v s="$sid" '$1==s{print $2; exit}')
+  fi
+  [[ -n $sid ]] || return 1
+
+  echo "Adopting $repo:fg → foreground here (claude -r ${sid[1,8]}… in $cwd)"
+  # Stop the foreground owner and wait for it to actually exit (≤5s) before resuming,
+  # so only one live claude ever holds the id — same race tpop guards against.
+  local pid; pid=$(_dev_pid_for_sid "$sid")
+  if [[ -n $pid ]]; then
+    kill -TERM "$pid" 2>/dev/null
+    local n=0
+    while kill -0 "$pid" 2>/dev/null && (( n++ < 100 )); do sleep 0.05; done
+    kill -0 "$pid" 2>/dev/null && \
+      echo "warning: foreground owner ($pid) didn't exit; resuming anyway — transcript may interleave." >&2
+  fi
+  cd "$cwd" && claude -r "$sid"
+}
+
 # _dev_list — print every dev-<repo>-<slot> tmux session, compact enough to read
 # on a phone (Termius). One line per session: a two-glyph STATUS field + short
 # name + what it's working on. The `dev-` prefix and the redundant
@@ -650,8 +708,13 @@ _dev_list() {
     (( ${#fsummary} > avail )) && fsummary="${fsummary[1,avail-1]}…"
     printf '  %s %s     %-*s %s%s%s\n' "${g}●${r0}" "$cmark" $name_w "$_fslot" "$y" "$fsummary" "$r0"
   done <<< "$fgrows"
+  # reattach legend: tmux slots via `dev <repo> <slot>`; a foreground (:fg) row is
+  # bound to its terminal, so it comes back foreground via `dev <repo> fg` (shown
+  # only when the list actually has a :fg row).
+  local foot="reattach: dev <repo> <slot>"
+  [[ -n $fgrows ]] && foot+=" · foreground (:fg): dev <repo> fg"
   print -r -- ""
-  print -r -- "  ${y}reattach: dev <repo> <slot>${r0}"
+  print -r -- "  ${y}${foot}${r0}"
 }
 
 # _dev_session_rows — machine-readable sibling of _dev_list: one tab-separated
@@ -779,8 +842,14 @@ _dev_list_remote() {
     hostcell=$host; [[ $host == local ]] && hostcell=
     printf '  %s %s     %-*s %-*s %s%s%s\n' "$amark" "$cmark" $host_w "$hostcell" $name_w "$slot" "$y" "$summary" "$r0"
   done <<< "$rows"
+  # reattach legend: tmux slots pull here with --here; a foreground (:fg) row is bound
+  # to its terminal, so it is reattached on its host via `on <host> dev <repo> fg`
+  # (shown only when a :fg row is present — slot is field 4 of the prefixed rows).
+  local foot="reattach: dev <repo> <slot> · on host: dev -r <repo> <slot> · pull: --here"
+  print -r -- "$rows" | awk -F'\t' '$4 ~ /:fg$/{f=1} END{exit !f}' \
+    && foot+=" · foreground (:fg): on <host> dev <repo> fg"
   print -r -- ""
-  print -r -- "  ${y}reattach: dev <repo> <slot> · on host: dev -r <repo> <slot> · pull: --here${r0}"
+  print -r -- "  ${y}${foot}${r0}"
 }
 
 # _dev_kill_one <session> <force> — kill a single dev tmux session. When it holds
@@ -893,6 +962,8 @@ _dev_new_session() {
 #
 # Commands:
 #   dev <repo> [slot|new]        open/reattach (slot 1-4, or 'new' to force fresh)
+#   dev <repo> fg                reattach a foreground (:fg) session here (claude -r;
+#                                stops its terminal-bound owner — matches how it runs)
 #   dev -r [repo [slot]]         attach a slot that's live on another $REMOTE_HOSTS
 #                                host (host auto-inferred; fzf-pick if several match)
 #   dev list | ls [-r] [-a]      list dev sessions (attached + active context),
@@ -1003,6 +1074,16 @@ dev() {
   if [[ ! -d "$dir" ]]; then
     echo "Repo dir not found: $dir"
     return 1
+  fi
+
+  # `dev <repo> fg` — reattach a FOREGROUND (:fg) session listed by `dev ls`. It is
+  # bound to its own terminal, so reattaching means MOVING it here: stop that owner
+  # and `claude -r` in THIS terminal. Matches how it is running — the tmux-slot analog
+  # is plain `dev <repo> <slot>`. (`fg` as the slot keyword mirrors the `<repo>:fg`
+  # label; -f is irrelevant here since fg is inherently a foreground resume.)
+  if [[ "$slot" == fg ]]; then
+    _dev_adopt_fg "$repo"
+    return
   fi
 
   # -f/--fg (a.k.a. --no-tmux): run claude inline, no tmux. If a SPECIFIC slot is
