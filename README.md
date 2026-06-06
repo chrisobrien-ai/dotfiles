@@ -1,6 +1,25 @@
 # dotfiles
 
-Personal shell config and utility scripts.
+Personal macOS + zsh dotfiles, built around a toolkit for running **Claude Code**
+in tmux — teleport, search, and sync Claude Code sessions across machines.
+
+## Highlights
+
+The everyday shell config (aliases, PATH, completions) is here, but the
+distinctive part is the Claude Code session tooling, all defined in `.zshrc`:
+
+- **`tpush` / `tpop`** — move a Claude Code session between a foreground terminal
+  and a detached background tmux session, with a one-live-owner guarantee.
+- **`tbeam`** — teleport a running Claude Code session to another machine (or
+  summon one back with `--here`) and resume it there.
+- **`tfind`** — semantic search across your saved Claude Code sessions ("which
+  session was working on X?"), reranked by Claude.
+- **`csync`** — two-way sync of Claude Code session history across machines via
+  iCloud Drive.
+
+Plus the usual macOS helpers: **`sleep-manager`** (block/restore sleep) and
+**`pii-scan`** (keep personal data out of this public repo). Run `help` for the
+full, auto-generated command list.
 
 ## Layout
 
