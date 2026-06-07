@@ -127,6 +127,15 @@ install_claude_settings
 git -C "$DOTFILES_DIR" config core.hooksPath .githooks
 echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
 
+# Materialize the private PII denylist when supplied (Cloud Agents / CI parity).
+# Set PII_SCRUB_RULES to the scrub-rules.json contents in the agent environment.
+if [[ -n "${PII_SCRUB_RULES:-}" ]]; then
+    mkdir -p "$HOME/.config/pii-scan"
+    printf '%s' "$PII_SCRUB_RULES" > "$HOME/.config/pii-scan/scrub-rules.json"
+    chmod 600 "$HOME/.config/pii-scan/scrub-rules.json"
+    echo "Materialized PII denylist -> $HOME/.config/pii-scan/scrub-rules.json"
+fi
+
 # Periodic csync is handled by a precmd hook in .zshrc (linked above), not a
 # launchd agent: iCloud Drive is TCC-protected and background agents are denied,
 # whereas the shell runs in the Terminal's already-approved context. Nothing to
