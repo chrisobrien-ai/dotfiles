@@ -136,21 +136,45 @@ prview() {
 # exit/Ctrl-C. For a backgrounded, persistent block use `sleep-manager` instead.
 nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }; trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
 
-# dots — fast-forward dotfiles to origin/main and reload zsh
+# dots — sync your dotfiles to origin/main HEAD and reload zsh
 #
 # Usage: dots
 #
-# Fetches origin/main and `git merge --ff-only` onto the current branch, then
-# re-sources ~/.zshrc. --ff-only keeps it safe: if the branch is ahead/diverged or
-# local edits would be overwritten, the merge aborts untouched and it just reloads.
-# Works from main or any dev branch that sits at/behind main (the dev-workflow norm).
+# Fetches origin/main, switches to the main branch, fast-forwards it to
+# origin/main HEAD, and re-sources ~/.zshrc — so your live dotfiles become exactly
+# what is published on main, with nothing done locally (no merge, no commit). main
+# is protected (you never commit to it directly), so the fast-forward always
+# applies. Develop on the dev branch via `t open dotfiles`; dots is the "just give
+# me the latest" command and leaves you on main. Safe: if the working tree has
+# uncommitted edits it stops and only reloads, never discarding work — commit or
+# stash first.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
   cd ~/code/dotfiles || return
-  git fetch origin main || { cd - > /dev/null; return 1; }
-  local branch=$(git symbolic-ref --short -q HEAD)
-  git merge --ff-only origin/main 2>/dev/null \
-    || print -u2 "dots: couldn't fast-forward '$branch' to origin/main (ahead/diverged or local edits) — reloaded only"
+
+  local g c y r0=
+  if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; y=$'\e[2m'; r0=$'\e[0m'; fi
+
+  if ! git fetch -q origin main 2>/dev/null; then
+    print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
+  elif ! git diff --quiet HEAD 2>/dev/null; then
+    print -r -- "${y}dots — uncommitted edits on ${c}$(git symbolic-ref --short -q HEAD)${r0}${y}; commit or stash first, reloaded only${r0}"
+  elif ! git checkout -q main 2>/dev/null; then
+    print -r -- "${y}dots — could not switch to main, reloaded only${r0}"
+  else
+    local before=$(git rev-parse --short main)
+    if git merge --ff-only origin/main >/dev/null 2>&1; then
+      local after=$(git rev-parse --short main)
+      if [[ $before == $after ]]; then
+        print -r -- "${g}✓${r0} ${y}on ${c}main${r0} ${y}at ${after} — already latest, reloaded${r0}"
+      else
+        print -r -- "${g}✓${r0} ${y}updated ${c}main${r0} ${y}${before} → ${after}, reloaded${r0}"
+      fi
+    else
+      print -r -- "${y}dots — main diverged from origin/main, can't fast-forward; reloaded only${r0}"
+    fi
+  fi
+
   source ~/.zshrc
   cd - > /dev/null
 }
@@ -2399,7 +2423,9 @@ _t_beam_xlate() {
 # `# name … — description` comment above each ~/.zshrc function and the header
 # line of each ~/bin script, so descriptions stay current as you add commands.
 # Grouping is the `groups` list below; anything not placed there shows under
-# "Other" so it's never hidden.
+# "Other" so it's never hidden — except the few internal/automatic commands in
+# the `_hide` list (a transparent wrapper, a hook, a guard), which are dropped
+# entirely since you never invoke them by hand.
 # (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
 help() {
   emulate -L zsh
@@ -2441,16 +2467,29 @@ help() {
     info[$_hk]="$_hk — run a command on ${REMOTE_HOSTS[$_hk]} (≡ t on $_hk)"
   done
 
+  # Internal/automatic commands — you never type these: `claude` is a transparent
+  # wrapper around the real CLI, `claude-stamp-tmux` is a SessionStart hook, and
+  # `pii-scan` runs from the git pre-commit hook + CI. Drop them from the list.
+  local _hide
+  for _hide in claude claude-stamp-tmux pii-scan; do unset "info[$_hide]"; done
+
   # Grouping by purpose.  "Title:cmd cmd …" — drop a command's name into a group
   # to file it; anything uncategorized falls through to "Other" at the end. The
   # Claude-session family is now the single `t` command (its verbs show in `t -h`).
   local -a groups=(
     "Dotfiles & shell:dots help"
+    "Repo shortcuts (cd):${(kj: :)DEV_REPOS}"
     "Remote machines:${(kj: :)REMOTE_HOSTS}"
     "Git & PRs:prview"
-    "Claude dev sessions (t <verb>):t ${(kj: :)DEV_REPOS}"
-    "Claude session sync:csync"
+    "Claude:t csync"
     "Keep the Mac awake:nosleep sleep-manager"
+  )
+
+  # Per-section "how to add" hints (keyed by group title) — printed dim under the
+  # rows for the generated sections, since those come from ~/.zshrc.local arrays.
+  local -A hints=(
+    "Repo shortcuts (cd)" "+ add a repo: DEV_REPOS[key]=~/code/repo in ~/.zshrc.local"
+    "Remote machines"     "+ add a host: REMOTE_HOSTS[key]=user@host in ~/.zshrc.local"
   )
 
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
@@ -2477,10 +2516,11 @@ help() {
     for n in $have; do
       printf '  %s%-*s%s  %s%s%s\n' "$C" $w "${info[$n]%% — *}" "$R" "$M" "${info[$n]#* — }" "$R"
     done
+    [[ -n ${hints[$title]} ]] && print -r -- "  ${D}${hints[$title]}${R}"
     print
   }
 
-  print -r -- "${D}Custom commands — 'help' to list, 'dots' to edit & reload.${R}"; print
+  print -r -- "${D}Custom commands — run 'help' (or 'h') to list; '<cmd> -h' for details.${R}"; print
   typeset -A shown
   local -a names
   for g in $groups; do
@@ -2494,6 +2534,7 @@ help() {
 
   unfunction _help_group
 }
+alias h=help   # `h` is a shorthand for `help`
 
 # --- tab completion for our commands -------------------------------------
 # compinit already ran at the top of this file, so compdef is available here.
