@@ -178,6 +178,7 @@ dots() {
     return
   fi
 
+  local prev_branch=$(git symbolic-ref --short -q HEAD)
   if ! git fetch -q origin main 2>/dev/null; then
     print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
   elif ! git diff --quiet HEAD 2>/dev/null; then
@@ -194,6 +195,11 @@ dots() {
         print -r -- "${g}✓${r0} ${y}updated ${c}main${r0} ${y}${before} → ${after}, reloaded${r0}"
       fi
     else
+      # Fast-forward failed: don't strand the user on a stale main — return to
+      # the branch they were on before the checkout above.
+      if [[ -n $prev_branch && $prev_branch != main ]]; then
+        git checkout -q "$prev_branch" 2>/dev/null
+      fi
       print -r -- "${y}dots — main diverged from origin/main, can't fast-forward; reloaded only${r0}"
     fi
   fi
@@ -635,6 +641,10 @@ _dev_fg_rows() {
   # prune registry entries whose pid is no longer a live claude (sessions that ended)
   local f bpid
   for f in "$reg"/*(N.); do bpid=${f:t}; [[ -z ${live[$bpid]} ]] && rm -f "$f"; done
+  # the prune loop exits 1 when its last entry is live ([[ ]] && short-circuit), and
+  # as the last command here that became _dev_session_rows' status — making remote
+  # scans look failed to _dev_rows_all, which drops their (good) rows.
+  return 0
 }
 
 # _dev_pid_for_sid <sid> — print the live `claude` pid that owns session <sid>, via
@@ -889,8 +899,11 @@ _dev_rows_all() {
       if [[ -z $rc || $rc == 255 ]]; then          # ssh-level failure = unreachable
         print -u2 -r -- "dev: $host unreachable — skipped"
         continue
+      elif [[ $rc == 127 ]]; then                  # command not found = stale dotfiles
+        print -u2 -r -- "dev: $host scan failed (rc=127; stale dotfiles? run \`dots\` there) — skipped"
+        continue
       elif [[ $rc != 0 ]]; then                    # reachable, but the scan errored
-        print -u2 -r -- "dev: $host scan failed (rc=$rc; stale dotfiles? run \`dots\` there) — skipped"
+        print -u2 -r -- "dev: $host scan failed (rc=$rc) — skipped"
         continue
       fi
     fi
