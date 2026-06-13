@@ -1787,25 +1787,42 @@ _dev_remote_kill() {
     # (field 4) — same reason _dev_remote_resolve does: a slot is `dev-dot-2` on
     # mini but `dev-dotfiles-2` here, both keying ~/code/dotfiles, so an alias
     # compare silently misses cross-host slots. Exclude foreground rows (`:` in
-    # field 4). Fall back to the alias-string match when the local alias has no
-    # DEV_REPOS dir.
+    # field 4). For each match keep the REMOTE's alias (slot field's prefix, last
+    # dash split) so the delegated `t kill` keys off a name that exists there —
+    # passing our local alias would have remote `_dev_kill` grep for sessions it
+    # does not have. (Remote `_dev_kill` already unions sibling aliases for `all`
+    # — see lines 1162–1175 — so one alias per host is enough to reach every slot
+    # in that tree.) Fall back to the alias-string match when the local alias has
+    # no DEV_REPOS dir.
     local dir="${DEV_REPOS[$repo]:-}"
-    local hosts
+    local pairs
     if [[ -n $dir ]]; then
-      hosts=$(_dev_rows_all 2>/dev/null \
-        | awk -F'\t' -v d="$dir" '$1 != "local" && $3==d && $4 !~ /:/ {print $1}' | sort -u)
+      pairs=$(_dev_rows_all 2>/dev/null \
+        | awk -F'\t' -v d="$dir" '$1 != "local" && $3==d && $4 !~ /:/ {
+            a=$4; sub(/-[0-9]+$/, "", a);
+            print $1 "\t" a
+          }' | awk -F'\t' '!seen[$1]++')
     else
-      hosts=$(_dev_rows_all 2>/dev/null \
-        | awk -F'\t' -v w="${repo}-" '$1 != "local" && index($4,w)==1 {print $1}' | sort -u)
+      pairs=$(_dev_rows_all 2>/dev/null \
+        | awk -F'\t' -v r="$repo" -v w="${repo}-" '$1 != "local" && index($4,w)==1 {print $1 "\t" r}' \
+        | awk -F'\t' '!seen[$1]++')
     fi
-    [[ -n $hosts ]] || { echo "dev: no live '$repo' sessions on any remote host (\`dev ls -r\`)." >&2; return 1; }
-    local h rtarget rcmd="t kill ${(q)repo} all" rc=0
-    [[ -n $force ]] && rcmd+=" -y"
-    for h in ${(f)hosts}; do
+    [[ -n $pairs ]] || { echo "dev: no live '$repo' sessions on any remote host (\`dev ls -r\`)." >&2; return 1; }
+    local pair h ralias rtarget rcmd rc=0
+    for pair in ${(f)pairs}; do
+      h=${pair%%$'\t'*}
+      ralias=${pair#*$'\t'}
       rtarget="${REMOTE_HOSTS[$h]:-$h}"
-      echo "→ Killing all dev-${repo}-* on $h"
-      _term_title "$h: kill $repo all"
-      ssh -t "$rtarget" "zsh -lic ${(qq)rcmd}" || rc=$?
+      rcmd="t kill ${(q)ralias} all"
+      [[ -n $force ]] && rcmd+=" -y"
+      echo "→ Killing all dev-${ralias}-* on $h"
+      _term_title "$h: kill $ralias all"
+      # rc is a sticky failure flag — set on any host failure and never reset on
+      # a later success — so the final exit is a clean boolean over the whole
+      # fan-out (any host failed → non-zero). Was rc=$?: that captured the last
+      # failure's exact code but never cleared on success, which made the value
+      # arbitrary across iterations.
+      ssh -t "$rtarget" "zsh -lic ${(qq)rcmd}" || rc=1
     done
     _term_title ""
     return $rc
@@ -2525,11 +2542,31 @@ _t_pop() {
       slot=$repo
       repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t pop <repo> $slot)."; return 1; }
     fi
+    # Same-dir sibling aliases (see _dev_kill): a `dev-dot-2` answers `t pop
+    # dotfiles 2` when `dot` and `dotfiles` both key ~/code/dotfiles. Without this
+    # the lookup misses the local slot and _dev_session_remote_fallback can pop
+    # it on another host while the local copy keeps running.
+    local -a _palias=( "$repo" )
+    if [[ -n ${DEV_REPOS[$repo]:-} ]]; then
+      local _pdir=${DEV_REPOS[$repo]} _pk
+      for _pk in ${(k)DEV_REPOS}; do
+        [[ $_pk == $repo || ${DEV_REPOS[$_pk]} != $_pdir ]] && continue
+        _palias+=( $_pk )
+      done
+    fi
     if [[ -z "$slot" ]]; then                      # first existing slot for repo
-      local n=1
+      local n=1 a
       while (( n <= 20 )); do
-        tmux has-session -t "dev-${repo}-${n}" 2>/dev/null && { slot=$n; break; }
+        for a in $_palias; do
+          tmux has-session -t "dev-${a}-${n}" 2>/dev/null && { repo=$a; slot=$n; break 2; }
+        done
         (( n++ ))
+      done
+    elif (( ${#_palias} > 1 )) && ! tmux has-session -t "dev-${repo}-${slot}" 2>/dev/null; then
+      local a
+      for a in $_palias; do
+        [[ $a == $repo ]] && continue
+        tmux has-session -t "dev-${a}-${slot}" 2>/dev/null && { repo=$a; break; }
       done
     fi
     session="dev-${repo}-${slot}"
