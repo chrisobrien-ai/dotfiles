@@ -335,6 +335,7 @@ def _infer_repo(cfg, slot=None):
 
 
 def cmd_read(cfg, args):
+    bare = args.repo is None and args.slot is None
     repo, slot = args.repo, args.slot
     # Repo-aware: `t read 4` ≡ slot 4 of the repo cwd is in; bare `t read` is its
     # first slot's log.
@@ -346,18 +347,18 @@ def cmd_read(cfg, args):
         _read_usage(cfg)
         return 1
     args.repo = repo
-    named_slot = slot          # truthy only if the user named a slot (vs bare `t read`)
     slot = slot or "1"
     logfile = os.path.join(HOME, ".tmux-logs", f"dev-{args.repo}-{slot}.log")
     if not os.path.isfile(logfile):
         # No log here — the slot may live on a remote host (the tmux log is host-local;
         # csync syncs transcripts, not ~/.tmux-logs). Try delegating the read to that
         # host over ssh -t, which renders the remote log in less through the ssh TTY.
-        # When no slot was named, probe for ANY of the repo's remote slots (empty slot →
-        # _dev_remote_resolve picks / fzf-picks), so a remote slot other than 1 is still
-        # found — bare `t read` defaults to LOCAL slot 1 but should not miss a remote 4.
+        # On a fully bare `t read` (no repo, no slot), probe for ANY of the inferred
+        # repo's remote slots (empty slot → _dev_remote_resolve picks / fzf-picks) so a
+        # remote slot other than 1 is still found. With a repo or slot explicitly named,
+        # pass the resolved slot so remote mirrors the local default of slot 1.
         # rc 0 = handled (or a no-TTY hint printed); rc 1 = live nowhere → local error.
-        if _try_remote_delegate(args.repo, named_slot or "", "read") == 0:
+        if _try_remote_delegate(args.repo, "" if bare else slot, "read") == 0:
             return 0
         print(f"No log found: {logfile}")
         print(f"(start a session with 't open {args.repo} {slot}' first)")
