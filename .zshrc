@@ -1330,7 +1330,8 @@ _t_dev() {
       print -r -- "  t open <id> | <repo> fg     adopt a foreground (:fg) session here (id from t ls)"
       print -r -- "  t open <repo> [slot] --fg   no tmux: foreground-resume / run inline"
       print -r -- "  t open <repo> [slot]        auto-attaches on another host if the slot is live there"
-      print -r -- "  t open <repo> [slot] --host <host>   start/attach on <host> (opens a NEW remote session)"
+      print -r -- "  t open <repo> [slot] -r --new        start a fresh session on the default remote host"
+      print -r -- "  t open <repo> [slot] --host <host>   start/attach on a specific host"
       print -r -- "  t beam <repo> [slot] --from <host>   pull that session HERE (move); omit --from to send"
       print -r -- "  t ls [-r] [-a]              list sessions (attached + active context)"
       print -r -- "  t kill <repo> <slot|all>    tear down a session (-y to skip the confirm)"
@@ -1531,6 +1532,17 @@ _dev_local_slot_live() {
   fi
 }
 
+# _dev_default_host — the host `t open -r --new` starts a fresh remote session on when
+# no --host is given. REMOTE_HOSTS is an UNORDERED assoc array, so "first remote host"
+# is made deterministic as the alphabetically-first key (with one or two machines, the
+# common case, there is nothing to disambiguate). Override per-invocation with --host.
+# Returns 1 (and prints nothing) when no remote hosts are configured.
+_dev_default_host() {
+  (( ${#REMOTE_HOSTS} )) || return 1
+  local -a hk; hk=(${(ok)REMOTE_HOSTS})
+  print -r -- "$hk[1]"
+}
+
 # _dev_remote <repo> <slot> <fg> — `dev -r [repo [slot]]`: resolve a live REMOTE slot
 # (host auto-inferred, _dev_remote_resolve) then ATTACH IN PLACE on its host. The
 # explicit `-r` entry — `t open` also auto-detects a remote slot when none is live
@@ -1547,7 +1559,13 @@ _dev_remote() {
   if [[ -z ${DEV_REPOS[$repo]:-} && -z $slot && $repo == <-> ]]; then
     local inferred; inferred=$(_t_infer_repo "$repo") && { slot=$repo; repo=$inferred; }
   fi
-  local res; res=$(_dev_remote_resolve "$repo" "$slot") || return 1
+  local res
+  if ! res=$(_dev_remote_resolve "$repo" "$slot"); then
+    # Nothing live to attach. `-r` is attach-only; starting one is `-r --new`.
+    local dh; dh=$(_dev_default_host) \
+      && echo "  to START one remotely: t open ${repo:-<repo>}${slot:+ $slot} -r --new   (on $dh; --host <h> to choose)" >&2
+    return 1
+  fi
   _dev_remote_attach "$res" "$fg"
 }
 
@@ -2805,12 +2823,20 @@ t() {
 
 # _t_open — map gh-grammar `t open <repo> [slot] [--new|--fg|--remote] [--host H]`
 # onto the existing `dev` grammar: --new→the `new` slot keyword, --fg→-f, --remote→-r;
-# repo/slot/-r/-f pass through (dev parses flags in any position). `--host H` forces a
-# FRESH-or-attach session ON host H (the only way to START a remote session — `-r`/
-# auto-detect only reach an already-live slot) and is dispatched via _dev_remote_open
-# with the original gh-style args (minus --host), so H's own `t open` re-parses them.
+# repo/slot/-r/-f pass through (dev parses flags in any position).
+#
+# Remote model (--remote and --host are CONSOLIDATED, two angles on one thing):
+#   --host H names WHICH host; -r/--remote means "remote, pick the host for me".
+#   • -r --new (no --host)  → START a fresh session on the default host (_dev_default_host,
+#                             the first $REMOTE_HOSTS); name one with --host to override.
+#   • --host H [--new]      → start/attach on H (the explicit-host path; -r is redundant
+#                             here and is dropped before forwarding).
+#   • -r (no --new)         → cross-host ATTACH of a live slot (host auto-inferred); handled
+#                             by _t_dev/_dev_remote below, NOT here.
+# The host paths dispatch via _dev_remote_open with the original gh-style args (minus
+# --host / -r), so H's own `t open` re-parses them from ITS $PWD.
 _t_open() {
-  local -a a rest; local arg want_host= host=
+  local -a a rest; local arg want_host= host= remote= isnew=
   for arg in "$@"; do
     if [[ -n $want_host ]]; then host=$arg; want_host=; continue; fi
     case "$arg" in
@@ -2819,21 +2845,35 @@ _t_open() {
     esac
     rest+=("$arg")
     case "$arg" in
-      --new)    a+=(new) ;;
-      --fg)     a+=(-f) ;;
-      --remote) a+=(-r) ;;
-      *)        a+=("$arg") ;;
+      --new|new)   a+=(new); isnew=1 ;;
+      --fg)        a+=(-f) ;;
+      -r|--remote) remote=1; a+=(-r) ;;
+      *)           a+=("$arg") ;;
     esac
   done
   [[ -n $want_host ]] && { echo "t open: --host requires a value" >&2; return 2; }
+
+  # `-r --new` with no --host: START fresh on the default remote host. (Plain `-r`
+  # with no --new falls through to _t_dev's cross-host ATTACH; --host below wins if set.)
+  if [[ -z $host && -n $remote && -n $isnew ]]; then
+    host=$(_dev_default_host) || {
+      echo "t open -r --new: no remote hosts configured (set REMOTE_HOSTS in ~/.zshrc.local)." >&2
+      return 1
+    }
+    echo "(no --host given — starting on $host; pass --host <h> to choose another)"
+  fi
+
   if [[ -n $host ]]; then
     # The remote `t open` re-parses these positionals from $host's own $PWD
     # (login dir, not this laptop's repo tree), so apply _t_dev's repo-aware
     # rewrite HERE — a lone slot/keyword or bare `t open --host h` would
-    # otherwise hit the wrong repo (or none) on the far side.
+    # otherwise hit the wrong repo (or none) on the far side. -r/--remote is
+    # dropped: the host is already chosen, and forwarding it would make the far
+    # side try its OWN remote attach instead of acting locally.
     local -a flags pos
     for arg in "${rest[@]}"; do
       case "$arg" in
+        -r|--remote) ;;
         --*) flags+=("$arg") ;;
         *)   pos+=("$arg") ;;
       esac
