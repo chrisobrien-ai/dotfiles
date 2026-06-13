@@ -1537,6 +1537,15 @@ _dev_local_slot_live() {
 # scan). Moving a session between machines is `tbeam`, not this. <fg> forwards `-f`.
 _dev_remote() {
   local repo="$1" slot="$2" fg="$3"
+  # Repo-aware: a lone slot-shaped arg (`t open -r 4`) means slot 4 of the repo $PWD is
+  # in — mirroring the local `t open 4` and `t kill -r 4` (see _dev_remote_kill). Without
+  # this the bare `4` is mis-read as a remote repo alias and never matches. Only triggers
+  # for a pure-digit positional that is not itself a DEV_REPOS key, and only when cwd maps
+  # to a repo; a truly bare `t open -r` (no positional) stays the documented all-remote
+  # picker. Inference failure leaves $repo as the raw digit so the resolver still errors.
+  if [[ -z ${DEV_REPOS[$repo]:-} && -z $slot && $repo == <-> ]]; then
+    local inferred; inferred=$(_t_infer_repo "$repo") && { slot=$repo; repo=$inferred; }
+  fi
   local res; res=$(_dev_remote_resolve "$repo" "$slot") || return 1
   _dev_remote_attach "$res" "$fg"
 }
