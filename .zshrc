@@ -263,8 +263,12 @@ unset _repo
 # per-host shortcuts) can reach. Key = short alias, value = ssh target. Real
 # entries are machine-specific, so they live in ~/.zshrc.local (declared above so
 # the local file can just add keys). Back-compat: an old MINI_HOST/TBEAM_HOST
-# seeds a `mini` alias when the registry has none, so prior configs keep working.
-[[ -z ${REMOTE_HOSTS[mini]} && -n ${MINI_HOST:-${TBEAM_HOST:-}} ]] \
+# seeds a `mini` alias ONLY when the whole registry is empty (a pre-REMOTE_HOSTS
+# config), so those configs keep working — but a machine that already populates
+# REMOTE_HOSTS and sets TBEAM_HOST purely as a `t beam` send default never gets a
+# phantom `mini` pointing at the beam target. (Gating on REMOTE_HOSTS[mini] alone
+# seeded `mini` even on a configured host the moment TBEAM_HOST was set.)
+(( ${#REMOTE_HOSTS} == 0 )) && [[ -n ${MINI_HOST:-${TBEAM_HOST:-}} ]] \
   && REMOTE_HOSTS[mini]="${MINI_HOST:-$TBEAM_HOST}"
 
 # _t_sync_config — derive ~/.config/t/config.sh from the live DEV_* / REMOTE_HOSTS
