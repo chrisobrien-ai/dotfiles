@@ -59,7 +59,11 @@ MAX_ATTEMPTS = 2
 
 # Repo root = the dir holding this script's bin/. realpath resolves the ~/bin
 # symlink back into the checkout, so worktrees are created from the real repo.
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# Override with $PR_WATCH_REPO_ROOT when watching a foreign $PR_WATCH_REPO so
+# `git fetch`/`git worktree add` target the matching local checkout (otherwise
+# the polled repo and the worktree-source repo would silently diverge).
+REPO_ROOT = os.environ.get("PR_WATCH_REPO_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__)))
 
 
 # ─── small helpers ─────────────────────────────────────────────────────────────
@@ -146,7 +150,10 @@ def classify(pr):
     """Return (reason_str, detail) if the PR needs a fix, else (None, None)."""
     if pr.get("isDraft") or pr.get("isCrossRepository"):
         return None, None
-    if (pr.get("mergeable") or "").upper() == "CONFLICTING":
+    # mergeable can be UNKNOWN while GitHub is still computing it; mergeStateStatus
+    # DIRTY is the authoritative "conflicts with base" signal in that window.
+    if (pr.get("mergeable") or "").upper() == "CONFLICTING" \
+       or (pr.get("mergeStateStatus") or "").upper() == "DIRTY":
         return "merge conflict with main", "conflict"
     bad = failing_checks(pr.get("statusCheckRollup"))
     if bad:
@@ -265,7 +272,9 @@ def cmd_poll(args):
     log("polled %s — %d open PR(s)%s" % (REPO, len(prs), " [dry-run]" if args.dry_run else ""))
 
     state = load_state()
-    acted, attempts, gaveup = state["acted"], state["attempts"], state["gaveup"]
+    acted = state.setdefault("acted", {})
+    attempts = state.setdefault("attempts", {})
+    gaveup = state.setdefault("gaveup", {})
     changed = False
 
     for pr in prs:
