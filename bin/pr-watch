@@ -41,6 +41,36 @@ import sys
 import uuid
 
 HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "pr-watch")
+ENABLED_FLAG = os.path.join(CONFIG_DIR, "enabled")
+# ~/.config/pr-watch/config — KEY=VALUE per line (sh-like, no quoting). Loaded
+# BEFORE reading $PR_WATCH_REPO / $PR_WATCH_REPO_ROOT so launchd-driven polls
+# pick up overrides (launchd hands the agent a minimal env; it does NOT source
+# zsh, so an `export` in ~/.zshrc.local never reaches the every-5-min entry
+# point). Process env still wins so an interactive `PR_WATCH_REPO=… pr-watch
+# poll` ad-hoc override beats the file.
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+
+
+def _load_config_file():
+    """Populate os.environ from CONFIG_FILE for any KEY not already set. Silent
+    on missing file / malformed lines so a fresh machine just sees env defaults."""
+    try:
+        with open(CONFIG_FILE) as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key and key not in os.environ:
+                    os.environ[key] = value.strip()
+    except OSError:
+        pass
+
+
+_load_config_file()
+
 REPO = os.environ.get("PR_WATCH_REPO", "chrisobrien-ai/dotfiles")
 SHORT = REPO.split("/")[-1]                 # "dotfiles" → session names pr-dotfiles-<N>
 
@@ -48,8 +78,6 @@ STATE_DIR = os.path.join(HOME, ".cache", "pr-watch")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 WORKTREES = os.path.join(STATE_DIR, "worktrees")
 TASKS_DIR = os.path.join(STATE_DIR, "tasks")
-CONFIG_DIR = os.path.join(HOME, ".config", "pr-watch")
-ENABLED_FLAG = os.path.join(CONFIG_DIR, "enabled")
 LOG = os.path.join(HOME, "Library", "Logs", "pr-watch.log")
 TMUX_LOG_DIR = os.path.join(HOME, ".tmux-logs")
 
@@ -146,17 +174,41 @@ def failing_checks(rollup):
     return bad
 
 
+def pending_checks(rollup):
+    """Names of checks still in-flight on this commit (not yet COMPLETED). After a
+    new push, GitHub often keeps OLDER failed runs in the rollup alongside fresh
+    in-progress ones — acting on the stale failure before the new CI finishes
+    causes premature autonomous sessions, so the CI branch in `classify` waits."""
+    pend = []
+    for c in rollup or []:
+        # CheckRun: status in {QUEUED, IN_PROGRESS, COMPLETED}; StatusContext:
+        # state in {PENDING, EXPECTED, SUCCESS, FAILURE, ERROR}.
+        status = (c.get("status") or "").upper()
+        state = (c.get("state") or "").upper()
+        if status and status != "COMPLETED":
+            pend.append(c.get("name") or c.get("context") or "check")
+        elif not status and state in ("PENDING", "EXPECTED"):
+            pend.append(c.get("name") or c.get("context") or "check")
+    return pend
+
+
 def classify(pr):
     """Return (reason_str, detail) if the PR needs a fix, else (None, None)."""
     if pr.get("isDraft") or pr.get("isCrossRepository"):
         return None, None
+    base = pr.get("baseRefName") or "main"
     # mergeable can be UNKNOWN while GitHub is still computing it; mergeStateStatus
     # DIRTY is the authoritative "conflicts with base" signal in that window.
     if (pr.get("mergeable") or "").upper() == "CONFLICTING" \
        or (pr.get("mergeStateStatus") or "").upper() == "DIRTY":
-        return "merge conflict with main", "conflict"
-    bad = failing_checks(pr.get("statusCheckRollup"))
+        return "merge conflict with %s" % base, "conflict"
+    rollup = pr.get("statusCheckRollup")
+    bad = failing_checks(rollup)
     if bad:
+        # Don't act on a failure while other checks are still in flight for this
+        # commit — the in-progress run may be the one that supersedes it.
+        if pending_checks(rollup):
+            return None, None
         return "failing CI: " + ", ".join(bad), "ci:" + ",".join(bad)
     return None, None
 
@@ -168,6 +220,7 @@ def write_brief(pr, reason, detail):
     can't accidentally commit it). Returns the absolute path."""
     os.makedirs(TASKS_DIR, exist_ok=True)
     num, branch, sha = pr["number"], pr["headRefName"], pr["headRefOid"]
+    base = pr.get("baseRefName") or "main"
     is_conflict = detail == "conflict"
     checks_hint = ""
     if not is_conflict:
@@ -176,9 +229,9 @@ def write_brief(pr, reason, detail):
             num, (r.stdout or "").strip()[:2000])
     fix_step = (
         "1. `git fetch origin`\n"
-        "2. `git merge origin/main` — resolve every conflict by UNION, preserving "
+        "2. `git merge origin/{base}` — resolve every conflict by UNION, preserving "
         "the intent of BOTH sides (do not drop either feature). Then `git add -A` "
-        "and `git commit --no-edit`."
+        "and `git commit --no-edit`.".format(base=base)
         if is_conflict else
         "1. `git fetch origin`\n"
         "2. Investigate the failing check(s) above (`gh run view <run-id> --log-failed` "
@@ -265,7 +318,7 @@ def cmd_poll(args):
         return 0
 
     prs = gh_json(["pr", "list", "--repo", REPO, "--state", "open", "--json",
-                   "number,headRefName,headRefOid,isDraft,isCrossRepository,"
+                   "number,headRefName,headRefOid,baseRefName,isDraft,isCrossRepository,"
                    "mergeable,mergeStateStatus,statusCheckRollup,author"])
     if prs is None:
         return 1
@@ -335,10 +388,18 @@ def _launchctl(action):
 def cmd_enable(args):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     open(ENABLED_FLAG, "a").close()
+    if not os.path.exists(PLIST):
+        log("enabled — no plist installed yet; run install.sh to schedule polling")
+        return 0
     _launchctl("bootstrap")
-    loaded = os.path.exists(PLIST)
+    # `launchctl list <label>` exits 0 only when the job is actually loaded —
+    # the source of truth used by `cmd_status`. `bootstrap` itself returns
+    # quietly when the agent is already loaded (or fails silently if the plist
+    # is malformed), so don't conflate "plist on disk" with "agent scheduled".
+    loaded = run(["launchctl", "list", LABEL]).returncode == 0
     log("enabled — %s" % ("LaunchAgent bootstrapped (polls every 5 min)" if loaded
-                          else "no plist installed yet; run install.sh to schedule polling"))
+                          else "plist on disk but launchd did not load it; "
+                               "try `launchctl bootout gui/$(id -u)/%s` and re-run" % LABEL))
     return 0
 
 
