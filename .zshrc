@@ -439,11 +439,14 @@ _t_paste() {
   # raising zsh's "no matches found" error. Collect into an array first so an
   # empty result never makes `ls` fall back to listing the current directory.
   # extended_glob is needed for the parenthesized alternation in the filename
-  # pattern; local_options restores the caller's setopts on return.
+  # pattern; local_options restores the caller's setopts on return. The leading
+  # (#i) makes the whole pattern case-INSENSITIVE — iPhone screenshots save as
+  # *.PNG (uppercase), and zsh globbing is case-sensitive even on macOS's
+  # case-insensitive filesystem, so a bare *.png silently skipped them.
   setopt local_options extended_glob
   local src
   local -a files
-  files=("$icloud"/*.(png|jpg|jpeg|heic|pdf|txt|md|csv|docx)(N))
+  files=("$icloud"/(#i)*.(png|jpg|jpeg|heic|pdf|txt|md|csv|docx)(N))
 
   if (( ${#files} == 0 )); then
     echo "No images or docs found in iCloud Drive ($icloud)"
