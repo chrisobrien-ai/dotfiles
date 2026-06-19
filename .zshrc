@@ -2841,12 +2841,15 @@ _tbeam_land() {
 # tbeam — move a Claude session between machines (send by default; --from receives)
 #
 # Usage: tbeam [flags] [repo [slot]] [host]
+#        tbeam <repo>:<id> [host]                  (beam a foreground session)
 #        tbeam <repo> [slot] --from <host>        (pull a session HERE)
 #        tbeam [repo [slot]] --here               (pull HERE, auto-find the host)
 #
 # Arguments:
 #   repo        a DEV_REPOS key → beam that dev slot's session (like tpop/tplan);
 #               omit to beam THIS conversation (inside Claude) or fzf-pick
+#   repo:id     a FOREGROUND label from `t ls` (a claude run directly in a
+#               terminal) → beam that session by id (lands in tmux unless -f)
 #   slot        which dev-<repo>-<slot> (default: its first live slot)
 #   host        destination machine (default: $TBEAM_HOST). A bare positional is
 #               read as a host only when it isn't a DEV_REPOS key.
@@ -2956,9 +2959,22 @@ _t_beam() {
     repo_arg=${pos[1]}
     if [[ ${pos[2]} == <-> ]]; then    # numeric → slot, then optional host
       slot_arg=${pos[2]}; host=${pos[3]}
+    elif [[ -z $sid_arg && ${pos[2]} == *:* ]]; then
+      # `t beam <repo> <repo>:<id>` — the second token is a FOREGROUND label from
+      # `t ls` (redundant repo prefix); beam that session by id. pos[3] is the host.
+      # Clear repo_arg so the -s id path resolves it (not the dev-slot path, which
+      # is tried first whenever repo_arg is set).
+      repo_arg=; sid_arg=${pos[2]##*:}; host=${pos[3]}
     else                               # no slot → second positional is the host
       host=${pos[2]}
     fi
+  elif [[ -z $sid_arg && ${pos[1]} == *:* ]]; then
+    # A bare FOREGROUND label — the `<repo>:<id>` shown by `t ls` for a claude run
+    # directly in a terminal (e.g. ff:727a2a8c). It has no dev slot, so route it
+    # through the -s id path below (the repo prefix is stripped); pos[2] is the host.
+    # A colon is unambiguous here (hosts/repos/slots never contain one); a bare id
+    # with no colon collides with a host name, so use `-s <id>` for that.
+    sid_arg=${pos[1]##*:}; host=${pos[2]}
   elif [[ ${pos[1]} == <-> ]]; then
     # Repo-aware: a lone numeric first positional is a SLOT of the repo $PWD is in
     # (`t beam 4` ≡ `t beam <cwd-repo> 4`, optional host after — see _t_infer_repo).
@@ -2983,7 +2999,10 @@ _t_beam() {
   #   • -s <id>  — an explicit id (full, or a unique prefix like the 8 chars the
   #     picker/tbeam show): resolve it locally to its transcript + recorded cwd,
   #     skipping both the picker and current-session mode. Lets you re-beam a
-  #     known id without picking.
+  #     known id without picking. A `<repo>:<id>` FOREGROUND label from `t ls`
+  #     passed as a positional (e.g. `t beam ff:727a2a8c`) feeds this same path
+  #     (the repo prefix is stripped above); its origin is a foreground claude, so
+  #     the kill-block below stops it by pid instead of kill-session.
   #   • inside Claude (no -p) — THIS conversation + $PWD.
   #   • otherwise — fzf-pick (scoped to $PWD; -a for every repo).
   # self_move = "the origin is THIS foreground claude" (true current-session
@@ -3051,7 +3070,22 @@ _t_beam() {
   #     branch), mirroring tpush's auto-exit.
   if [[ -z $self_move ]]; then
     local killed; killed=$(TB_SID=$sid _tbeam_kill_owner)
-    [[ $killed == dev-* ]] && echo "✂ Stopped the local copy ($killed) — moved to $host"
+    if [[ $killed == dev-* ]]; then
+      echo "✂ Stopped the local copy ($killed) — moved to $host"
+    else
+      # No dev slot owned the id — a FOREGROUND claude (the `<repo>:<id>` rows in
+      # `t ls`) might. Stop it too, so beaming a foreground session is a real MOVE
+      # and not two live owners: claude takes no transcript lock, so two resumers of
+      # one id diverge (the invariant tpush/tpop/_dev_adopt_fg protect). SIGTERM the
+      # pid via the registry, then wait for it to exit before $host takes over.
+      local fgpid; fgpid=$(_dev_pid_for_sid "$sid")
+      if [[ -n $fgpid ]]; then
+        kill -TERM "$fgpid" 2>/dev/null
+        local n=0
+        while kill -0 "$fgpid" 2>/dev/null && (( n++ < 100 )); do sleep 0.05; done
+        echo "✂ Stopped the local foreground copy (pid $fgpid) — moved to $host"
+      fi
+    fi
   fi
 
   # Foreground mode: resume straight in the ssh session (needs a real terminal).
