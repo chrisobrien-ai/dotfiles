@@ -267,11 +267,8 @@ _dev_branch_for() { print -r -- "${DEV_BRANCHES[$1]:-$DEV_BRANCH}" }
 # _dev_worktree_enabled <repo> — true unless this repo (or the global default) opts out.
 _dev_worktree_enabled() {
   local v=${DEV_WORKTREE[$1]:-}
-  if [[ -n $v ]]; then
-    [[ $v != 0 && $v != no && $v != off && $v != false ]]
-  else
-    [[ ${DEV_WORKTREE_DEFAULT:-1} != 0 ]]
-  fi
+  [[ -n $v ]] || v=${DEV_WORKTREE_DEFAULT:-1}
+  [[ $v != 0 && $v != no && $v != off && $v != false ]]
 }
 # _dev_worktree_path <repo> <slot> — disk location of the slot's worktree.
 _dev_worktree_path()   { print -r -- "${DEV_WORKTREE_ROOT}/${DEV_REPOS[$1]:t}/$2" }
@@ -294,9 +291,10 @@ _dev_worktree_create() {
   fi
   git -C "$repodir" worktree prune 2>/dev/null    # clear any stale registration first
   git -C "$repodir" fetch -q origin 2>/dev/null   # refresh origin/main before branching
-  if git -C "$repodir" show-ref --verify --quiet "refs/heads/$br" \
-     || git -C "$repodir" show-ref --verify --quiet "refs/remotes/origin/$br"; then
-    git -C "$repodir" worktree add -q "$wt" "$br" 2>/dev/null               # resume lingering slot branch
+  if git -C "$repodir" show-ref --verify --quiet "refs/heads/$br"; then
+    git -C "$repodir" worktree add -q "$wt" "$br" 2>/dev/null               # resume lingering local slot branch
+  elif git -C "$repodir" show-ref --verify --quiet "refs/remotes/origin/$br"; then
+    git -C "$repodir" worktree add -q -b "$br" "$wt" "origin/$br" 2>/dev/null # branch exists only on origin → create local tracking + check out
   else
     git -C "$repodir" worktree add -q -b "$br" "$wt" origin/main 2>/dev/null # fresh off main
   fi
@@ -1625,11 +1623,29 @@ _t_dev() {
   # DEV_REPOS dir this leaves repo empty and the usage below explains.
   # `t open 4 --new` lands here as `repo=4 slot=new` (--new became a positional in
   # _t_open) — the explicit numeric slot still wins, the redundant keyword drops.
+  local _bare_repo=
+  [[ -z $repo ]] && _bare_repo=1
   if [[ -z ${DEV_REPOS[$repo]:-} && ( $repo == <-> || $repo == new || $repo == fg ) \
         && ( -z $slot || $slot == new || $slot == fg ) ]]; then
-    slot=$repo; repo=
+    slot=$repo; repo=; _bare_repo=1
   fi
   [[ -z $repo ]] && repo=$(_t_infer_repo "$slot")
+
+  # Worktree-aware bare open: standing inside a per-session worktree
+  # ($DEV_WORKTREE_ROOT/<basename>/<slot>) defaults the slot to ITS slot, so
+  # `t open` from that dir targets the matching session instead of the lowest
+  # free gap. Only when the repo was inferred from $PWD (no explicit repo arg) —
+  # an explicit `t open <other-repo>` from inside an unrelated repo's worktree
+  # must not adopt that worktree's slot. _dev_repo_of_dir prints "<alias>\t<slot>"
+  # (slot empty for a canonical repo dir or subdir, populated for a worktree
+  # path) — same source `t read` already uses for cwd→slot inference in bin/t.
+  if [[ -z $slot && -n $repo && -n $_bare_repo ]]; then
+    local _wsr _wss
+    _wsr=$(_dev_repo_of_dir "$PWD" 2>/dev/null) && {
+      _wss=${_wsr#*$'\t'}
+      [[ -n $_wss ]] && slot=$_wss
+    }
+  fi
 
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
@@ -1855,13 +1871,18 @@ _dev_remote_resolve() {
   # repo/slot pair (`dot:a4aa5f6a` has no `-`) and `_dev_remote_attach`/
   # `_dev_remote_delegate` would ssh with a malformed `t` command.
   local dir="${DEV_REPOS[$repo]:-}"
+  # Worktree-aware: a slot's session may root at $DEV_WORKTREE_ROOT/<basename>/<slot>
+  # (per-session worktree) instead of the canonical repo dir. The basename + worktree
+  # root are stable across hosts (same as _dev_dir_in_scope), so accept either path
+  # — else live worktree slots silently miss and `t open` mints a duplicate locally.
+  local base="${dir:t}" wtr="${DEV_WORKTREE_ROOT:-}"
   local match
   if [[ -z $repo ]]; then
     match=$rows                                                  # bare → all remote
   elif [[ -n $dir && -n $slot ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" '$3==d && $4 !~ /:/ && $4 ~ ("-" s "$")')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
   elif [[ -n $dir ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" '$3==d && $4 !~ /:/')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/')
   elif [[ -n $slot ]]; then
     match=$(print -r -- "$rows" | awk -F'\t' -v w="${repo}-${slot}" '$4==w')
   else
