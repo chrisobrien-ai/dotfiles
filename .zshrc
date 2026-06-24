@@ -449,17 +449,24 @@ add-zsh-hook precmd _clawsync_periodic
 # ancestor link so `git branch --merged`/merge-base miss them); an OPEN PR is a hard
 # not-merged. Falls back to the git-only ancestor test when gh is absent/unauth. Any
 # inconclusive answer is treated as NOT merged, so the sweep never deletes on a maybe.
+# Both paths pin the answer to the CURRENT branch tip: per-slot branch names are reused
+# after a sweep (`dev/<basename>-<slot>`), so an unrelated historical merged PR with the
+# same head, OR a freshly-created branch sitting exactly at origin/main with uncommitted
+# working-tree edits, must NOT be reported as merged — that would destroy live work.
 _dev_branch_merged() {
-  local repodir="$1" br="$2" n open
+  local repodir="$1" br="$2" tip merged_oid open main_oid
+  tip=$(git -C "$repodir" rev-parse --verify -q "refs/heads/$br" 2>/dev/null)
+  [[ -n $tip ]] || return 1                       # no local branch → nothing to compare
   if command -v gh >/dev/null 2>&1; then
-    n=$(cd "$repodir" 2>/dev/null && gh pr list --head "$br" --state merged --json number -q '.[0].number' 2>/dev/null)
-    [[ -n $n ]] && return 0
+    merged_oid=$(cd "$repodir" 2>/dev/null && gh pr list --head "$br" --state merged --json headRefOid -q '.[0].headRefOid' 2>/dev/null)
+    [[ -n $merged_oid && $merged_oid == "$tip" ]] && return 0   # this exact commit was merged
     open=$(cd "$repodir" 2>/dev/null && gh pr list --head "$br" --state open --json number -q '.[0].number' 2>/dev/null)
     [[ -n $open ]] && return 1
   fi
   git -C "$repodir" fetch -q origin main 2>/dev/null
-  git -C "$repodir" rev-parse --verify -q refs/remotes/origin/main >/dev/null 2>&1 || return 1
-  git -C "$repodir" show-ref --verify -q "refs/heads/$br" || return 1
+  main_oid=$(git -C "$repodir" rev-parse --verify -q refs/remotes/origin/main 2>/dev/null)
+  [[ -n $main_oid ]] || return 1
+  [[ "$tip" != "$main_oid" ]] || return 1         # branch == origin/main → no unique history yet; uncommitted edits may still be live
   git -C "$repodir" merge-base --is-ancestor "$br" origin/main 2>/dev/null
 }
 # _dev_worktree_sweep_run — the actual reap (runs detached). Walks every
@@ -2672,8 +2679,14 @@ _dev_slot_for_cwd() {
   # generic scan, which would return a different slot number while cwd stays pinned
   # to this worktree — pairing the new slot with another slot's checkout/branch and
   # colliding with the live owner already in it. Callers handle the "couldn't map".
+  # "Taken" is judged by session_path, not by name alone: an unrelated dev-<repo>-<n>
+  # session rooted elsewhere (a stale shared-tree slot from before worktree-per-session,
+  # or a same-named session in another checkout) does NOT own this worktree, so the
+  # slot is still ours to claim.
   if [[ -n $slot ]]; then
-    tmux has-session -t "dev-${match}-${slot}" 2>/dev/null && return 1
+    local existing_path
+    existing_path=$(tmux display-message -p -t "dev-${match}-${slot}" '#{session_path}' 2>/dev/null)
+    [[ -n $existing_path && ${existing_path:A} == ${cwd:A} ]] && return 1
     print -r -- "$match $slot"; return 0
   fi
   # Else next free slot: first dev-<repo>-<n> with no running session (mirrors `dev`).
