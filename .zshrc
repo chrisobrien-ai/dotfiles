@@ -2354,8 +2354,13 @@ _t_find() {
   cwd=${${row#*$'\t'}%%$'\t'*}
   # Resume-through-sync: a picked session may be a per-session worktree absent here (created
   # on another machine, or reaped after merge). Rebuild it from its branch rather than failing.
-  cwd=$(_dev_ensure_session_cwd "$cwd") \
+  # _dev_ensure_session_cwd prints nothing on failure, so capture into a temp and only overwrite
+  # $cwd on success — else the error message below would have lost the session path (matches the
+  # same fix in _t_push).
+  local resolved
+  resolved=$(_dev_ensure_session_cwd "$cwd") \
     || { echo "Session's directory no longer exists and could not be rebuilt: $cwd" >&2; return 1; }
+  cwd=$resolved
   echo "Resuming claude -r ${sid[1,8]}… in $cwd"
   cd "$cwd" && claude -r "$sid"
 }
