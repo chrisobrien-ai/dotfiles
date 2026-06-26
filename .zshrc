@@ -321,7 +321,10 @@ _dev_worktree_beam_push() {
   local br; br=$(git -C "$wt" symbolic-ref --short -q HEAD) || return 0
   if [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
     git -C "$wt" add -A 2>/dev/null
-    git -C "$wt" commit -q -m "wip: beam to ${host:-another host} [skip ci]" 2>/dev/null
+    if ! git -C "$wt" commit -q -m "wip: beam to ${host:-another host} [skip ci]" 2>/dev/null; then
+      print -r -- "tbeam: couldn't commit WIP in ${wt} (pre-commit hook?) — destination won't see your latest edits" >&2
+      return 0
+    fi
   fi
   if git -C "$wt" push -q origin "HEAD:${br}" 2>/dev/null; then
     print -r -- "↑ carried ${br} → origin"
@@ -353,8 +356,11 @@ _dev_worktree_beam_sync() {
   ref=$(git -C "$wt" rev-parse -q --verify "origin/${br}" 2>/dev/null)
   [[ -n $ref && $head != "$ref" ]] || return 0          # no remote branch, or already at the tip
   if git -C "$wt" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
-    git -C "$wt" merge -q --ff-only "origin/${br}" 2>/dev/null \
-      && print -r -- "↓ synced ${br} to the beamed edits"
+    if git -C "$wt" merge -q --ff-only "origin/${br}" 2>/dev/null; then
+      print -r -- "↓ synced ${br} to the beamed edits"
+    else
+      print -r -- "tbeam: couldn't fast-forward ${wt} to origin/${br} — left as-is (sync manually)" >&2
+    fi
   else
     print -r -- "tbeam: ${wt} diverged from origin/${br} — left as-is (resolve manually)" >&2
   fi
@@ -2251,7 +2257,7 @@ _dev_pull() {
   # Carry the origin worktree's uncommitted edits with the move: commit-all + push its branch
   # ON the remote (over ssh, work passed in TB_* env like _tbeam_land) so the local worktree can
   # fast-forward to them below. The mirror of the SEND path's local _dev_worktree_beam_push.
-  ssh "$target" "TB_WT=${(q)cwd} TB_HOST=${(q)$(hostname -s)} zsh -lic _dev_worktree_beam_push" 2>/dev/null
+  ssh "$target" "TB_WT=${(q)cwd} TB_HOST=${(q)$(hostname -s)} zsh -lic _dev_worktree_beam_push"
   # Worktree mode: $cwd is the origin's per-session worktree (same root on every host).
   # Materialize it locally from its branch on origin if absent, rather than hard-failing.
   if [[ ! -d $cwd ]]; then
