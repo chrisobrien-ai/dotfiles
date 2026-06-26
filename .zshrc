@@ -3295,7 +3295,7 @@ _t_beam() {
   # and creating a local worktree would leave a stray checkout behind on a move. For the
   # same reason, only require the cwd to pre-exist on the host for NON-worktree paths;
   # worktree paths (under $DEV_WORKTREE_ROOT) are materialized by _tbeam_land.
-  if [[ -z $DEV_WORKTREE_ROOT || $cwd != $DEV_WORKTREE_ROOT/* ]]; then
+  if [[ -z $DEV_WORKTREE_ROOT || $cwd != $DEV_WORKTREE_ROOT/*/* ]]; then
     if ! ssh "$host" "test -d ${(q)cwd}" 2>/dev/null; then
       echo "tbeam: $cwd doesn't exist on $host — clone/sync the repo there first." >&2
       return 1
