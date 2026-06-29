@@ -2254,6 +2254,17 @@ _dev_pull() {
   local cwd=${${row#*$'\t'}%%$'\t'*}
   local fslot=${${${row#*$'\t'}#*$'\t'}%%$'\t'*}
   [[ -n $sid && $sid != - ]] || { echo "dev: $host/$fslot has no active conversation to pull" >&2; return 1; }
+
+  echo "⟳ Pulling ${sid[1,8]}… ($cwd) from $host → here"
+  # It's a MOVE: stop the origin copy on <host> FIRST, before snapshotting its
+  # worktree + transcript, so a still-live claude there can't keep editing files
+  # (the worktree push below would miss them) or appending to the transcript (the
+  # pull below would miss the tail) between the snapshot and the move — the same
+  # invariant tpush/tpop/tbeam protect.
+  local killed
+  killed=$(ssh "$target" "TB_SID=${(q)sid} zsh -lic _tbeam_kill_owner" 2>/dev/null | tail -1)
+  [[ $killed == dev-* ]] && echo "✂ Stopped the live copy on $host ($killed)"
+
   # Carry the origin worktree's uncommitted edits with the move: commit-all + push its branch
   # ON the remote (over ssh, work passed in TB_* env like _tbeam_land) so the local worktree can
   # fast-forward to them below. The mirror of the SEND path's local _dev_worktree_beam_push.
@@ -2267,14 +2278,7 @@ _dev_pull() {
   [[ -d $cwd ]] || { echo "dev: $cwd doesn't exist here — clone/sync the repo first." >&2; return 1; }
   _dev_worktree_beam_sync "$cwd"      # fast-forward to the edits the origin just pushed
 
-  echo "⟳ Pulling ${sid[1,8]}… ($cwd) from $host → here"
   _tbeam_pull_transcript "$cwd" "$target" || return 1
-
-  # It's a MOVE: stop the origin copy on <host> (the dev slot stamped with this id)
-  # so two live owners don't diverge — the same invariant tpush/tpop/tbeam protect.
-  local killed
-  killed=$(ssh "$target" "TB_SID=${(q)sid} zsh -lic _tbeam_kill_owner" 2>/dev/null | tail -1)
-  [[ $killed == dev-* ]] && echo "✂ Stopped the live copy on $host ($killed)"
 
   # If this exact id is already running in a local dev slot, reuse it (one owner).
   local existing s
@@ -3381,18 +3385,19 @@ _t_beam() {
   fi
 
   echo "⟳ Beaming ${sid[1,8]}… ($cwd) → $host"
-  _dev_worktree_beam_push "$cwd" "$host"        # carry uncommitted worktree edits ahead of the move
-  _tbeam_sync_transcript "$cwd" "$host" || return 1
-
-  # It's a MOVE, not a copy: now that the transcript is on $host, stop the origin
-  # (here) so the id has one live owner. Two cases for "the origin":
+  # It's a MOVE, not a copy: stop the origin BEFORE snapshotting code + transcript,
+  # so a still-live claude can't keep editing files in the worktree (the push below
+  # would miss those edits) or appending to the transcript (the sync below would
+  # miss the tail) between the snapshot and the move — leaving the destination to
+  # resume with stale code despite a newer transcript. Two cases for "the origin":
   #   • a LOCAL dev slot (picker mode, or an -s id that's live in a slot) — kill it
   #     now, before the blocking ssh -t branches below take over the terminal. We
   #     aren't attached to it, so this is safe. (self_move excludes the case where
   #     that slot is the very claude we're running inside.)
   #   • THIS foreground claude (self_move — a current-session move) — can't
   #     kill-session it; instead we SIGTERM it at the very end (see the detached
-  #     branch), mirroring tpush's auto-exit.
+  #     branch), mirroring tpush's auto-exit. No race here either: claude is
+  #     blocked executing this very command, so it can't edit files mid-beam.
   if [[ -z $self_move ]]; then
     local killed; killed=$(TB_SID=$sid _tbeam_kill_owner)
     if [[ $killed == dev-* ]]; then
@@ -3419,6 +3424,8 @@ _t_beam() {
       fi
     fi
   fi
+  _dev_worktree_beam_push "$cwd" "$host"        # carry uncommitted worktree edits ahead of the move
+  _tbeam_sync_transcript "$cwd" "$host" || return 1
 
   # Foreground mode: resume straight in the ssh session (needs a real terminal).
   if [[ -n $fg ]]; then
